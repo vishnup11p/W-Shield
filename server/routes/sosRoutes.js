@@ -4,9 +4,57 @@ const { db } = require('../services/firebaseAdmin');
 const { computeGeohash, findNearbyUsers } = require('../services/geoFireService');
 const { sendEmergencyPushNotification } = require('../services/notificationService');
 
+// In-memory retry/escalation active tracker for active sessions
+const activeEscalationTimers = new Map();
+
+/**
+ * Helper to trigger escalation if no contact acknowledges within 45 seconds
+ */
+function scheduleEscalationTimer(sessionId, victimUid, latitude, longitude) {
+  if (activeEscalationTimers.has(sessionId)) {
+    clearTimeout(activeEscalationTimers.get(sessionId));
+  }
+
+  const timer = setTimeout(async () => {
+    try {
+      if (!db) return;
+      const snap = await db.ref(`sosSessions/${sessionId}`).once('value');
+      const session = snap.val();
+
+      // If session is still not confirmed/resolved, trigger ESCALATION
+      if (session && (session.status === 'TRIGGERED' || session.status === 'SENDING')) {
+        console.log(`[ESCALATION TRIGGERED] Session ${sessionId} unacknowledged after timeout. Escalating...`);
+        
+        // 1. Update status to ESCALATED
+        await db.ref(`sosSessions/${sessionId}/status`).set('ESCALATED');
+        await db.ref(`sosSessions/${sessionId}/escalatedAt`).set(Date.now());
+
+        // 2. Widen nearby radius to 2.5km to find broader responders
+        const wideRadius = parseInt(process.env.ESCALATED_NEARBY_RADIUS_METERS) || 2500;
+        const expandedNearbyUsers = await findNearbyUsers(latitude, longitude, wideRadius, victimUid);
+        const tokens = expandedNearbyUsers.map(u => u.fcmToken).filter(Boolean);
+
+        if (tokens.length > 0) {
+          await sendEmergencyPushNotification(tokens, {
+            title: '🚨 CRITICAL ESCALATED SOS ALERT',
+            body: `Emergency alert for ${session.victimName || 'a citizen'} is unacknowledged. Expanding community response radius (${wideRadius}m).`,
+            sessionId,
+            type: 'ESCALATED_SOS',
+            latitude: parseFloat(latitude.toFixed(3)),
+            longitude: parseFloat(longitude.toFixed(3))
+          });
+        }
+      }
+    } catch (err) {
+      console.error('[Escalation Timer Error]', err.message);
+    }
+  }, 45000); // 45 second escalation window
+
+  activeEscalationTimers.set(sessionId, timer);
+}
+
 /**
  * POST /api/sos/trigger
- * Trigger a new SOS session
  */
 router.post('/trigger', async (req, res) => {
   try {
@@ -22,12 +70,16 @@ router.post('/trigger', async (req, res) => {
       approximateAddress = 'Live Location Stream'
     } = req.body;
 
-    if (!victimUid || latitude === undefined || longitude === undefined) {
-      return res.status(400).json({ error: 'victimUid, latitude, and longitude are required' });
+    // Strict validation
+    if (!victimUid || typeof victimUid !== 'string') {
+      return res.status(400).json({ error: 'Valid victimUid is required' });
+    }
+    if (latitude === undefined || longitude === undefined || isNaN(latitude) || isNaN(longitude)) {
+      return res.status(400).json({ error: 'Valid latitude and longitude numeric values are required' });
     }
 
     const sessionId = `sos_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
-    const geohash = computeGeohash(latitude, longitude);
+    const geohash = computeGeohash(Number(latitude), Number(longitude));
 
     const sessionData = {
       sessionId,
@@ -37,10 +89,10 @@ router.post('/trigger', async (req, res) => {
       status: 'SENDING',
       triggerType,
       networkStateAtTrigger,
-      batteryLevel,
+      batteryLevel: Number(batteryLevel) || 1.0,
       initialLocation: {
-        latitude,
-        longitude,
+        latitude: Number(latitude),
+        longitude: Number(longitude),
         geohash,
         approximateAddress
       },
@@ -49,31 +101,32 @@ router.post('/trigger', async (req, res) => {
     };
 
     if (db) {
-      // 1. Write SOS session to RTDB
       await db.ref(`sosSessions/${sessionId}`).set(sessionData);
-      // 2. Mark user active session
       await db.ref(`users/${victimUid}/activeSOSId`).set(sessionId);
-      // 3. Write initial ping
       await db.ref(`locationPings/${sessionId}`).push({
-        latitude,
-        longitude,
+        latitude: Number(latitude),
+        longitude: Number(longitude),
         geohash,
         timestamp: Date.now()
       });
     }
 
-    // 4. Discover nearby users for community alerting
-    const nearbyUsers = await findNearbyUsers(latitude, longitude, 1000, victimUid);
+    // Schedule escalation timeout (45s window)
+    scheduleEscalationTimer(sessionId, victimUid, Number(latitude), Number(longitude));
+
+    // Nearby user dispatch
+    const defaultRadius = parseInt(process.env.DEFAULT_NEARBY_RADIUS_METERS) || 1000;
+    const nearbyUsers = await findNearbyUsers(Number(latitude), Number(longitude), defaultRadius, victimUid);
     const nearbyTokens = nearbyUsers.map(u => u.fcmToken).filter(Boolean);
 
     if (nearbyTokens.length > 0) {
       await sendEmergencyPushNotification(nearbyTokens, {
-        title: '⚠️ EMERGENCY NEARBY',
-        body: `A person roughly 500-1000m from your location needs emergency help.`,
+        title: '⚠️ EMERGENCY SOS NEARBY',
+        body: `A person roughly within 1km of your location has triggered an SOS alert.`,
         sessionId,
         type: 'NEARBY_SOS',
-        latitude: parseFloat(latitude.toFixed(3)),
-        longitude: parseFloat(longitude.toFixed(3))
+        latitude: parseFloat(Number(latitude).toFixed(3)),
+        longitude: parseFloat(Number(longitude).toFixed(3))
       });
     }
 
@@ -91,16 +144,22 @@ router.post('/trigger', async (req, res) => {
 
 /**
  * POST /api/sos/acknowledge
- * Emergency contact acknowledges SOS
  */
 router.post('/acknowledge', async (req, res) => {
   try {
     const { sessionId, contactId, contactName } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+
+    // Cancel escalation timer if active
+    if (activeEscalationTimers.has(sessionId)) {
+      clearTimeout(activeEscalationTimers.get(sessionId));
+      activeEscalationTimers.delete(sessionId);
+      console.log(`[Acknowledgment] Escalation timer stopped for session ${sessionId}`);
+    }
 
     const ackData = {
       contactId: contactId || 'web_dashboard',
-      contactName: contactName || 'Family Member',
+      contactName: contactName || 'Emergency Contact',
       acknowledgedAt: Date.now()
     };
 
@@ -117,12 +176,16 @@ router.post('/acknowledge', async (req, res) => {
 
 /**
  * POST /api/sos/resolve
- * Resolves / cancels active SOS session with PIN
  */
 router.post('/resolve', async (req, res) => {
   try {
-    const { sessionId, victimUid, pin } = req.body;
-    if (!sessionId) return res.status(400).json({ error: 'sessionId required' });
+    const { sessionId, victimUid } = req.body;
+    if (!sessionId) return res.status(400).json({ error: 'sessionId is required' });
+
+    if (activeEscalationTimers.has(sessionId)) {
+      clearTimeout(activeEscalationTimers.get(sessionId));
+      activeEscalationTimers.delete(sessionId);
+    }
 
     if (db) {
       await db.ref(`sosSessions/${sessionId}/status`).set('RESOLVED');
@@ -140,7 +203,6 @@ router.post('/resolve', async (req, res) => {
 
 /**
  * GET /api/sos/nearby
- * Query nearby users directly
  */
 router.get('/nearby', async (req, res) => {
   try {
@@ -150,7 +212,7 @@ router.get('/nearby', async (req, res) => {
     const excludeUid = req.query.excludeUid || null;
 
     if (isNaN(lat) || isNaN(lng)) {
-      return res.status(400).json({ error: 'lat and lng query parameters required' });
+      return res.status(400).json({ error: 'Valid numeric lat and lng query parameters are required' });
     }
 
     const users = await findNearbyUsers(lat, lng, radius, excludeUid);

@@ -9,9 +9,10 @@ import {
   ScrollView,
   TextInput,
   Alert,
-  ActivityIndicator
+  ActivityIndicator,
+  Modal
 } from 'react-native';
-import { Shield, Radio, Phone, User, CheckCircle, AlertTriangle, Wifi, Navigation } from 'lucide-react-native';
+import { Shield, Radio, Phone, User, CheckCircle, AlertTriangle, Wifi, Navigation, Lock, Settings } from 'lucide-react-native';
 
 import { getCurrentGPSPosition, startContinuousLocationTracking, stopContinuousLocationTracking } from './src/services/locationService';
 import { getNetworkState, subscribeToNetworkState } from './src/services/netinfoService';
@@ -21,9 +22,15 @@ import { startShakeDetection, stopShakeDetection } from './src/services/triggerS
 import { BACKEND_URL } from './src/config/firebaseConfig';
 
 export default function App() {
-  // Application State
+  // Auth & Onboarding state
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [phoneInput, setPhoneInput] = useState('+919876543210');
+  const [otpInput, setOtpInput] = useState('123456');
+  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
+
+  // App & SOS State
   const [networkStatus, setNetworkStatus] = useState('ONLINE');
-  const [sosState, setSosState] = useState('IDLE'); // IDLE | TRIGGERED | SENDING | CONFIRMED | RESOLVED
+  const [sosState, setSosState] = useState('IDLE'); // IDLE | TRIGGERED | SENDING | CONFIRMED | ESCALATED | RESOLVED
   const [activeSessionId, setActiveSessionId] = useState(null);
   const [currentCoords, setCurrentCoords] = useState(null);
   const [userProfile, setUserProfile] = useState({
@@ -38,11 +45,17 @@ export default function App() {
   const [newContactName, setNewContactName] = useState('');
   const [newContactPhone, setNewContactPhone] = useState('');
   const [shakeEnabled, setShakeEnabled] = useState(true);
+  const [simulatingOffline, setSimulatingOffline] = useState(false);
 
   // 1. Setup Network and Shake Monitoring on Mount
   useEffect(() => {
-    getNetworkState().then(setNetworkStatus);
-    const unsubscribeNet = subscribeToNetworkState((mode) => setNetworkStatus(mode));
+    getNetworkState().then((state) => {
+      if (!simulatingOffline) setNetworkStatus(state);
+    });
+
+    const unsubscribeNet = subscribeToNetworkState((mode) => {
+      if (!simulatingOffline) setNetworkStatus(mode);
+    });
 
     if (shakeEnabled && sosState === 'IDLE') {
       startShakeDetection((type) => {
@@ -54,7 +67,21 @@ export default function App() {
       unsubscribeNet();
       stopShakeDetection();
     };
-  }, [shakeEnabled, sosState]);
+  }, [shakeEnabled, sosState, simulatingOffline]);
+
+  // Handle Phone / OTP Login
+  const handleVerifyOtp = () => {
+    if (!phoneInput || !otpInput) {
+      Alert.alert('Required', 'Please enter your phone number and 6-digit OTP code.');
+      return;
+    }
+    setIsVerifyingOtp(true);
+    setTimeout(() => {
+      setIsVerifyingOtp(false);
+      setIsAuthenticated(true);
+      setUserProfile(prev => ({ ...prev, phone: phoneInput }));
+    }, 800);
+  };
 
   // 2. Multi-Modal SOS Trigger Pipeline
   const triggerSOS = async (triggerType = 'BUTTON') => {
@@ -69,7 +96,7 @@ export default function App() {
       setCurrentCoords(gps);
 
       // Step B: Assess Network Adaptation State
-      const netMode = await getNetworkState();
+      const netMode = simulatingOffline ? 'OFFLINE' : await getNetworkState();
       setNetworkStatus(netMode);
       setSosState('SENDING');
 
@@ -114,7 +141,7 @@ export default function App() {
 
       setSosState('CONFIRMED');
     } catch (err) {
-      Alert.alert('SOS Trigger Error', err.message);
+      Alert.alert('Location Permission or GPS Error', err.message);
       setSosState('IDLE');
     }
   };
@@ -141,16 +168,67 @@ export default function App() {
   };
 
   const addContact = () => {
-    if (!newContactName || !newContactPhone) {
-      Alert.alert('Required', 'Please enter both contact name and phone number.');
+    if (!newContactName.trim() || !newContactPhone.trim()) {
+      Alert.alert('Required', 'Please enter both contact name and valid phone number.');
       return;
     }
-    setContacts([...contacts, { id: `c_${Date.now()}`, name: newContactName, phone: newContactPhone }]);
+    setContacts([...contacts, { id: `c_${Date.now()}`, name: newContactName.trim(), phone: newContactPhone.trim() }]);
     setNewContactName('');
     setNewContactPhone('');
   };
 
   const isSOSActive = sosState === 'TRIGGERED' || sosState === 'SENDING' || sosState === 'CONFIRMED';
+
+  // Render Login / Onboarding Screen
+  if (!isAuthenticated) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#0a0e17" />
+        <View style={styles.authWrapper}>
+          <View style={styles.authLogoBox}>
+            <Shield size={44} color="#ef4444" />
+          </View>
+          <Text style={styles.authTitle}>SafeGuard</Text>
+          <Text style={styles.authSubtitle}>Network-Adaptive Women Safety System</Text>
+
+          <View style={styles.authCard}>
+            <Text style={styles.inputLabel}>Registered Phone Number</Text>
+            <TextInput
+              style={styles.input}
+              value={phoneInput}
+              onChangeText={setPhoneInput}
+              keyboardType="phone-pad"
+              placeholder="+91..."
+              placeholderTextColor="#6b7280"
+            />
+
+            <Text style={styles.inputLabel}>Enter 6-Digit OTP</Text>
+            <TextInput
+              style={styles.input}
+              value={otpInput}
+              onChangeText={setOtpInput}
+              keyboardType="numeric"
+              maxLength={6}
+              placeholder="123456"
+              placeholderTextColor="#6b7280"
+            />
+
+            <TouchableOpacity
+              activeOpacity={0.8}
+              onPress={handleVerifyOtp}
+              style={styles.loginBtn}
+            >
+              {isVerifyingOtp ? (
+                <ActivityIndicator color="#fff" />
+              ) : (
+                <Text style={styles.loginBtnText}>Verify & Open SafeGuard</Text>
+              )}
+            </TouchableOpacity>
+          </View>
+        </View>
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container}>
@@ -162,9 +240,24 @@ export default function App() {
           <Shield size={28} color="#ef4444" />
           <Text style={styles.brandTitle}>SafeGuard</Text>
         </View>
-        <View style={[styles.networkBadge, networkStatus === 'ONLINE' ? styles.netOnline : styles.netOffline]}>
-          <Wifi size={12} color="#fff" />
-          <Text style={styles.networkText}>{networkStatus}</Text>
+
+        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+          {/* Offline Toggle for easy live presentation demo */}
+          <TouchableOpacity
+            onPress={() => {
+              const next = !simulatingOffline;
+              setSimulatingOffline(next);
+              setNetworkStatus(next ? 'OFFLINE' : 'ONLINE');
+            }}
+            style={[styles.simBadge, simulatingOffline ? styles.simActive : null]}
+          >
+            <Text style={styles.simText}>{simulatingOffline ? 'DEMO: OFFLINE' : 'DEMO: ONLINE'}</Text>
+          </TouchableOpacity>
+
+          <View style={[styles.networkBadge, networkStatus === 'ONLINE' ? styles.netOnline : styles.netOffline]}>
+            <Wifi size={12} color="#fff" />
+            <Text style={styles.networkText}>{networkStatus}</Text>
+          </View>
         </View>
       </View>
 
@@ -256,6 +349,63 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: '#0a0e17'
   },
+  authWrapper: {
+    flex: 1,
+    justifyContent: 'center',
+    padding: 24
+  },
+  authLogoBox: {
+    width: 80,
+    height: 80,
+    borderRadius: 24,
+    backgroundColor: 'rgba(239, 68, 68, 0.15)',
+    borderWidth: 1,
+    borderColor: 'rgba(239, 68, 68, 0.4)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    alignSelf: 'center',
+    marginBottom: 16
+  },
+  authTitle: {
+    fontSize: 28,
+    fontWeight: '800',
+    color: '#ffffff',
+    textAlign: 'center',
+    letterSpacing: -0.5
+  },
+  authSubtitle: {
+    fontSize: 13,
+    color: '#9ca3af',
+    textAlign: 'center',
+    marginBottom: 32,
+    marginTop: 4
+  },
+  authCard: {
+    backgroundColor: 'rgba(26, 34, 52, 0.7)',
+    borderRadius: 20,
+    padding: 22,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)'
+  },
+  inputLabel: {
+    color: '#cbd5e1',
+    fontSize: 12,
+    fontWeight: '600',
+    marginBottom: 6,
+    marginTop: 4
+  },
+  loginBtn: {
+    backgroundColor: '#ef4444',
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginTop: 14
+  },
+  loginBtnText: {
+    color: '#ffffff',
+    fontSize: 15,
+    fontWeight: '700'
+  },
   header: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -275,6 +425,23 @@ const styles = StyleSheet.create({
     fontWeight: '800',
     color: '#ffffff',
     letterSpacing: -0.5
+  },
+  simBadge: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 8,
+    backgroundColor: 'rgba(255, 255, 255, 0.06)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.15)'
+  },
+  simActive: {
+    backgroundColor: 'rgba(245, 158, 11, 0.2)',
+    borderColor: 'rgba(245, 158, 11, 0.5)'
+  },
+  simText: {
+    color: '#f59e0b',
+    fontSize: 10,
+    fontWeight: '700'
   },
   networkBadge: {
     flexDirection: 'row',

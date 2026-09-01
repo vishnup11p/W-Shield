@@ -1,0 +1,48 @@
+{
+  "rules": {
+    ".read": false,
+    ".write": false,
+    "users": {
+      ".read": "auth != null",
+      "$uid": {
+        ".read": "auth != null",
+        ".write": "auth != null && (auth.uid === $uid || auth.token.admin === true)",
+        ".indexOn": ["currentLocation/geohash"]
+      }
+    },
+    "emergencyContacts": {
+      "$uid": {
+        ".read": "auth != null",
+        ".write": "auth != null && (auth.uid === $uid || auth.token.admin === true)"
+      }
+    },
+    "sosSessions": {
+      ".read": "auth != null",
+      ".write": "auth != null",
+      ".indexOn": ["victimUid", "status", "startedAt"],
+      "$sessionId": {
+        ".read": "auth != null",
+        ".write": "auth != null"
+      }
+    },
+    "locationPings": {
+      "$sessionId": {
+        ".read": "auth != null",
+        ".write": "auth != null",
+        ".indexOn": ["timestamp"]
+      }
+    },
+    "evidence": {
+      "$sessionId": {
+        ".read": "auth != null",
+        ".write": "auth != null"
+      }
+    },
+    "nearbyAlerts": {
+      "$sessionId": {
+        ".read": "auth != null",
+        ".write": "auth != null"
+      }
+    }
+  }
+}

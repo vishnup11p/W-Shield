@@ -1,8 +1,8 @@
 import React, { useState, useEffect } from 'react';
-import { db, ref, onValue } from './services/firebase';
+import { db, ref, onValue, BACKEND_URL } from './services/firebase';
 import ActiveSessionMap from './components/ActiveSessionMap';
 import EvidencePlayer from './components/EvidencePlayer';
-import { Shield, Radio, CheckCircle, AlertTriangle, Phone, Battery, Wifi, Clock, Users } from 'lucide-react';
+import { Shield, Radio, CheckCircle, AlertTriangle, Phone, Battery, Wifi, Clock, AlertOctagon, RefreshCw } from 'lucide-react';
 
 export default function App() {
   const [sessions, setSessions] = useState({});
@@ -10,27 +10,39 @@ export default function App() {
   const [pings, setPings] = useState([]);
   const [evidenceList, setEvidenceList] = useState([]);
   const [acknowledging, setAcknowledging] = useState(false);
+  const [loadingSessions, setLoadingSessions] = useState(true);
+  const [errorMsg, setErrorMsg] = useState(null);
 
   // 1. Listen to all SOS sessions from Firebase Realtime Database
   useEffect(() => {
     try {
       const sessionsRef = ref(db, 'sosSessions');
-      const unsubscribe = onValue(sessionsRef, (snapshot) => {
-        const val = snapshot.val();
-        if (val) {
-          setSessions(val);
-          // Auto-select latest active session if none selected
-          if (!selectedSessionId) {
-            const keys = Object.keys(val);
-            if (keys.length > 0) {
-              setSelectedSessionId(keys[keys.length - 1]);
+      const unsubscribe = onValue(
+        sessionsRef,
+        (snapshot) => {
+          setLoadingSessions(false);
+          setErrorMsg(null);
+          const val = snapshot.val();
+          if (val) {
+            setSessions(val);
+            if (!selectedSessionId) {
+              const keys = Object.keys(val);
+              if (keys.length > 0) {
+                setSelectedSessionId(keys[keys.length - 1]);
+              }
             }
+          } else {
+            setSessions({});
           }
+        },
+        (err) => {
+          console.warn('[Firebase RTDB] Connection notice:', err.message);
+          setLoadingSessions(false);
         }
-      });
+      );
       return () => unsubscribe();
     } catch (e) {
-      console.warn('Firebase RTDB not connected directly in client, using fallback state:', e);
+      setLoadingSessions(false);
     }
   }, [selectedSessionId]);
 
@@ -82,18 +94,17 @@ export default function App() {
     if (!selectedSessionId) return;
     setAcknowledging(true);
     try {
-      const res = await fetch('http://localhost:5000/api/sos/acknowledge', {
+      const res = await fetch(`${BACKEND_URL}/api/sos/acknowledge`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           sessionId: selectedSessionId,
-          contactId: 'dashboard_viewer',
+          contactId: 'dashboard_responder',
           contactName: 'Emergency Responder / Family'
         })
       });
       const data = await res.json();
       if (data.success) {
-        // Updated state locally
         setSessions(prev => ({
           ...prev,
           [selectedSessionId]: {
@@ -147,7 +158,12 @@ export default function App() {
             </span>
           </h2>
 
-          {Object.keys(sessions).length === 0 ? (
+          {loadingSessions ? (
+            <div style={{ textAlign: 'center', padding: '40px 10px', color: 'var(--text-muted)' }}>
+              <RefreshCw size={24} className="pulse-emergency" style={{ margin: '0 auto 10px' }} />
+              <p style={{ fontSize: '0.85rem' }}>Connecting to Realtime Database...</p>
+            </div>
+          ) : Object.keys(sessions).length === 0 ? (
             <div style={{ textAlign: 'center', padding: '40px 10px', color: 'var(--text-muted)', fontSize: '0.88rem' }}>
               <AlertTriangle size={32} style={{ margin: '0 auto 10px', opacity: 0.5 }} />
               No active SOS alerts currently logged.
@@ -156,7 +172,7 @@ export default function App() {
             <div style={{ display: 'flex', flexDirection: 'column', gap: '12px' }}>
               {Object.entries(sessions).map(([id, session]) => {
                 const isSelected = id === selectedSessionId;
-                const isOngoing = session.status === 'TRIGGERED' || session.status === 'SENDING';
+                const isOngoing = session.status === 'TRIGGERED' || session.status === 'SENDING' || session.status === 'ESCALATED';
                 return (
                   <div
                     key={id}
@@ -200,7 +216,13 @@ export default function App() {
           {activeSession ? (
             <>
               {/* Emergency Banner Card */}
-              <div className="glass-panel" style={{ padding: '24px', borderLeft: '6px solid var(--accent-red)' }}>
+              <div
+                className="glass-panel"
+                style={{
+                  padding: '24px',
+                  borderLeft: `6px solid ${activeSession.status === 'ESCALATED' ? '#f59e0b' : 'var(--accent-red)'}`
+                }}
+              >
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: '16px' }}>
                   <div>
                     <div style={{ display: 'flex', alignItems: 'center', gap: '10px', marginBottom: '6px' }}>
@@ -262,7 +284,7 @@ export default function App() {
                 SafeGuard Emergency Operations Center
               </h2>
               <p style={{ color: 'var(--text-muted)', maxWidth: '500px', margin: '0 auto', fontSize: '0.9rem' }}>
-                Select an active SOS session from the left panel or trigger an emergency distress call from the mobile application.
+                No incident currently selected. Trigger an SOS alert from the mobile application or select an active session from the left sidebar.
               </p>
             </div>
           )}

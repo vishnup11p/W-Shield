@@ -4,16 +4,19 @@ const { db } = require('../services/firebaseAdmin');
 
 /**
  * GET /api/contacts/:uid
- * Retrieve emergency contacts for a user
  */
 router.get('/:uid', async (req, res) => {
   try {
     const { uid } = req.params;
+    if (!uid || typeof uid !== 'string') {
+      return res.status(400).json({ error: 'Valid user ID parameter is required' });
+    }
+
     if (!db) {
       return res.json({
         contacts: [
           { id: 'c1', name: 'Mom', phone: '+919876543210', relationship: 'Mother', priority: 1 },
-          { id: 'c2', name: 'Brother (Alex)', phone: '+919876543211', relationship: 'Brother', priority: 2 }
+          { id: 'c2', name: 'Alex (Brother)', phone: '+919876543211', relationship: 'Brother', priority: 2 }
         ]
       });
     }
@@ -29,23 +32,28 @@ router.get('/:uid', async (req, res) => {
 
 /**
  * POST /api/contacts/:uid
- * Add or update an emergency contact
  */
 router.post('/:uid', async (req, res) => {
   try {
     const { uid } = req.params;
     const { name, phone, relationship = 'Contact', priority = 1 } = req.body;
 
-    if (!name || !phone) {
-      return res.status(400).json({ error: 'name and phone are required' });
+    if (!uid || typeof uid !== 'string') {
+      return res.status(400).json({ error: 'Valid user ID parameter is required' });
+    }
+    if (!name || typeof name !== 'string' || name.trim().length === 0) {
+      return res.status(400).json({ error: 'Contact name is required' });
+    }
+    if (!phone || typeof phone !== 'string' || phone.trim().length < 6) {
+      return res.status(400).json({ error: 'Valid phone number is required (at least 6 digits)' });
     }
 
     const contactId = `contact_${Date.now()}`;
     const contactData = {
-      name,
-      phone,
-      relationship,
-      priority,
+      name: name.trim(),
+      phone: phone.trim(),
+      relationship: relationship.trim(),
+      priority: Number(priority) || 1,
       createdAt: Date.now()
     };
 
@@ -61,11 +69,14 @@ router.post('/:uid', async (req, res) => {
 
 /**
  * DELETE /api/contacts/:uid/:contactId
- * Remove an emergency contact
  */
 router.delete('/:uid/:contactId', async (req, res) => {
   try {
     const { uid, contactId } = req.params;
+    if (!uid || !contactId) {
+      return res.status(400).json({ error: 'Both uid and contactId are required' });
+    }
+
     if (db) {
       await db.ref(`emergencyContacts/${uid}/${contactId}`).remove();
     }
