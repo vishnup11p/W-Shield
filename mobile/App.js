@@ -10,19 +10,19 @@ import {
   TextInput,
   Alert,
   ActivityIndicator,
-  Modal
+  Switch
 } from 'react-native';
-import { Shield, Radio, Phone, User, CheckCircle, AlertTriangle, Wifi, Navigation, Lock, Settings } from 'lucide-react-native';
+import { Shield, Radio, Phone, User, CheckCircle, AlertTriangle, Wifi, Navigation, Mic, Activity } from 'lucide-react-native';
 
 import { getCurrentGPSPosition, startContinuousLocationTracking, stopContinuousLocationTracking } from './src/services/locationService';
 import { getNetworkState, subscribeToNetworkState } from './src/services/netinfoService';
-import { sendEmergencySMSPhase1, buildEmergencyMessage } from './src/services/smsFallbackService';
+import { sendEmergencySMSPhase1, sendEmergencySMSPhase2, buildEmergencyMessage } from './src/services/smsFallbackService';
 import { startEvidenceRecording, stopEvidenceRecording } from './src/services/evidenceService';
-import { startShakeDetection, stopShakeDetection } from './src/services/triggerService';
+import { startShakeDetection, stopShakeDetection, startVoiceDetection, stopVoiceDetection } from './src/services/triggerService';
 import { BACKEND_URL } from './src/config/firebaseConfig';
 
 export default function App() {
-  // Auth & Onboarding state
+  // Auth & Onboarding State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [phoneInput, setPhoneInput] = useState('+919876543210');
   const [otpInput, setOtpInput] = useState('123456');
@@ -44,10 +44,14 @@ export default function App() {
   ]);
   const [newContactName, setNewContactName] = useState('');
   const [newContactPhone, setNewContactPhone] = useState('');
+  
+  // Feature Toggles
   const [shakeEnabled, setShakeEnabled] = useState(true);
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [usePhase2SMS, setUsePhase2SMS] = useState(false);
   const [simulatingOffline, setSimulatingOffline] = useState(false);
 
-  // 1. Setup Network and Shake Monitoring on Mount
+  // 1. Setup Network and Multi-Modal Listeners on Mount
   useEffect(() => {
     getNetworkState().then((state) => {
       if (!simulatingOffline) setNetworkStatus(state);
@@ -58,16 +62,19 @@ export default function App() {
     });
 
     if (shakeEnabled && sosState === 'IDLE') {
-      startShakeDetection((type) => {
-        triggerSOS(type);
-      });
+      startShakeDetection((type) => triggerSOS(type));
+    }
+
+    if (voiceEnabled && sosState === 'IDLE') {
+      startVoiceDetection((type) => triggerSOS(type));
     }
 
     return () => {
       unsubscribeNet();
       stopShakeDetection();
+      stopVoiceDetection();
     };
-  }, [shakeEnabled, sosState, simulatingOffline]);
+  }, [shakeEnabled, voiceEnabled, sosState, simulatingOffline]);
 
   // Handle Phone / OTP Login
   const handleVerifyOtp = () => {
@@ -80,18 +87,18 @@ export default function App() {
       setIsVerifyingOtp(false);
       setIsAuthenticated(true);
       setUserProfile(prev => ({ ...prev, phone: phoneInput }));
-    }, 800);
+    }, 600);
   };
 
-  // 2. Multi-Modal SOS Trigger Pipeline
+  // 2. Full Multi-Modal SOS Trigger Pipeline
   const triggerSOS = async (triggerType = 'BUTTON') => {
     if (sosState !== 'IDLE' && sosState !== 'RESOLVED') return;
 
     setSosState('TRIGGERED');
-    console.log(`[SOS] Initiating emergency trigger: ${triggerType}`);
+    console.log(`[SOS TRIGGERED] Type: ${triggerType}`);
 
     try {
-      // Step A: Acquire current GPS position
+      // Step A: Acquire Real GPS Coordinates
       const gps = await getCurrentGPSPosition();
       setCurrentCoords(gps);
 
@@ -122,18 +129,23 @@ export default function App() {
           const data = await res.json();
           if (data.sessionId) sessionId = data.sessionId;
         } catch (backendErr) {
-          console.warn('[SOS] Backend unreachable, proceeding with client sync:', backendErr.message);
+          console.warn('[SOS] Backend connection notice:', backendErr.message);
         }
       }
 
-      // Step D: Trigger Phase 1 SMS Fallback (Share-Sheet) if offline or poor connectivity
+      // Step D: Trigger SMS Fallback (Phase 1 Share-Sheet vs Phase 2 Silent) if offline
       if (netMode === 'OFFLINE' || netMode === 'POOR') {
         const recipientPhones = contacts.map(c => c.phone);
         const alertMsg = buildEmergencyMessage(userProfile.name, gps.latitude, gps.longitude);
-        await sendEmergencySMSPhase1(recipientPhones, alertMsg);
+        
+        if (usePhase2SMS) {
+          await sendEmergencySMSPhase2(recipientPhones, alertMsg);
+        } else {
+          await sendEmergencySMSPhase1(recipientPhones, alertMsg);
+        }
       }
 
-      // Step E: Escalation of Sensors (Continuous GPS Tracking & Chunk Evidence Recording)
+      // Step E: Escalation of Sensors (High-Frequency GPS + Audio Evidence Chunking)
       startContinuousLocationTracking((ping) => {
         setCurrentCoords(ping);
       });
@@ -141,7 +153,7 @@ export default function App() {
 
       setSosState('CONFIRMED');
     } catch (err) {
-      Alert.alert('Location Permission or GPS Error', err.message);
+      Alert.alert('GPS or Hardware Error', err.message);
       setSosState('IDLE');
     }
   };
@@ -242,7 +254,6 @@ export default function App() {
         </View>
 
         <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-          {/* Offline Toggle for easy live presentation demo */}
           <TouchableOpacity
             onPress={() => {
               const next = !simulatingOffline;
@@ -265,7 +276,7 @@ export default function App() {
         {/* Main SOS Trigger Action */}
         <View style={styles.sosCard}>
           <Text style={styles.sosPrompt}>
-            {isSOSActive ? 'EMERGENCY TRANSMISSION ACTIVE' : 'PRESS OR SHAKE TO SEND SOS'}
+            {isSOSActive ? 'EMERGENCY TRANSMISSION ACTIVE' : 'PRESS, SHAKE, OR CALL OUT TO SEND SOS'}
           </Text>
 
           <TouchableOpacity
@@ -281,8 +292,8 @@ export default function App() {
 
           <Text style={styles.sosSubtext}>
             {isSOSActive
-              ? `State: ${sosState} • Streaming GPS Coordinates`
-              : 'Auto-detects Offline Mode & launches SMS Fallback'}
+              ? `State: ${sosState} • Streaming GPS & Audio Chunks`
+              : 'Network-Adaptive • Shake & Voice Armed'}
           </Text>
         </View>
 
@@ -291,13 +302,57 @@ export default function App() {
           <View style={styles.coordsCard}>
             <View style={styles.coordRow}>
               <Navigation size={16} color="#06b6d4" />
-              <Text style={styles.coordTitle}>Last Location Ping:</Text>
+              <Text style={styles.coordTitle}>Active GPS Telemetry:</Text>
             </View>
             <Text style={styles.coordText}>
               LAT: {currentCoords.latitude?.toFixed(6)} | LNG: {currentCoords.longitude?.toFixed(6)}
             </Text>
           </View>
         )}
+
+        {/* Triggers & Settings Card */}
+        <View style={[styles.sectionCard, { marginBottom: 16 }]}>
+          <View style={styles.sectionHeader}>
+            <Activity size={18} color="#a5b4fc" />
+            <Text style={styles.sectionTitle}>Multi-Modal Sensor Controls</Text>
+          </View>
+
+          <View style={styles.toggleRow}>
+            <View>
+              <Text style={styles.toggleLabel}>Shake-to-SOS (Accelerometer)</Text>
+              <Text style={styles.toggleSub}>Rapid shake triggers emergency state</Text>
+            </View>
+            <Switch
+              value={shakeEnabled}
+              onValueChange={setShakeEnabled}
+              trackColor={{ false: '#374151', true: '#ef4444' }}
+            />
+          </View>
+
+          <View style={[styles.toggleRow, { borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.06)', paddingTop: 10 }]}>
+            <View>
+              <Text style={styles.toggleLabel}>Voice-Trigger SOS</Text>
+              <Text style={styles.toggleSub}>Monitors for urgent distress cry</Text>
+            </View>
+            <Switch
+              value={voiceEnabled}
+              onValueChange={setVoiceEnabled}
+              trackColor={{ false: '#374151', true: '#ef4444' }}
+            />
+          </View>
+
+          <View style={[styles.toggleRow, { borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.06)', paddingTop: 10 }]}>
+            <View>
+              <Text style={styles.toggleLabel}>Phase 2 Silent SMS</Text>
+              <Text style={styles.toggleSub}>Requires custom dev-client build</Text>
+            </View>
+            <Switch
+              value={usePhase2SMS}
+              onValueChange={setUsePhase2SMS}
+              trackColor={{ false: '#374151', true: '#10b981' }}
+            />
+          </View>
+        </View>
 
         {/* Emergency Contacts Section */}
         <View style={styles.sectionCard}>
@@ -480,10 +535,11 @@ const styles = StyleSheet.create({
   },
   sosPrompt: {
     color: '#9ca3af',
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '700',
     letterSpacing: 1,
-    marginBottom: 20
+    marginBottom: 20,
+    textAlign: 'center'
   },
   sosButton: {
     width: 170,
@@ -555,6 +611,21 @@ const styles = StyleSheet.create({
     color: '#ffffff',
     fontSize: 15,
     fontWeight: '700'
+  },
+  toggleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 6
+  },
+  toggleLabel: {
+    color: '#ffffff',
+    fontSize: 13,
+    fontWeight: '600'
+  },
+  toggleSub: {
+    color: '#9ca3af',
+    fontSize: 11
   },
   contactItem: {
     flexDirection: 'row',
