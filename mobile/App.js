@@ -1,0 +1,439 @@
+import React, { useState, useEffect } from 'react';
+import {
+  StyleSheet,
+  Text,
+  View,
+  TouchableOpacity,
+  SafeAreaView,
+  StatusBar,
+  ScrollView,
+  TextInput,
+  Alert,
+  ActivityIndicator
+} from 'react-native';
+import { Shield, Radio, Phone, User, CheckCircle, AlertTriangle, Wifi, Navigation } from 'lucide-react-native';
+
+import { getCurrentGPSPosition, startContinuousLocationTracking, stopContinuousLocationTracking } from './src/services/locationService';
+import { getNetworkState, subscribeToNetworkState } from './src/services/netinfoService';
+import { sendEmergencySMSPhase1, buildEmergencyMessage } from './src/services/smsFallbackService';
+import { startEvidenceRecording, stopEvidenceRecording } from './src/services/evidenceService';
+import { startShakeDetection, stopShakeDetection } from './src/services/triggerService';
+import { BACKEND_URL } from './src/config/firebaseConfig';
+
+export default function App() {
+  // Application State
+  const [networkStatus, setNetworkStatus] = useState('ONLINE');
+  const [sosState, setSosState] = useState('IDLE'); // IDLE | TRIGGERED | SENDING | CONFIRMED | RESOLVED
+  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [currentCoords, setCurrentCoords] = useState(null);
+  const [userProfile, setUserProfile] = useState({
+    uid: 'user_jane_doe_101',
+    name: 'Jane Doe',
+    phone: '+919876543210'
+  });
+  const [contacts, setContacts] = useState([
+    { id: 'c1', name: 'Mom', phone: '+919876543210', relationship: 'Mother' },
+    { id: 'c2', name: 'Alex (Brother)', phone: '+919876543211', relationship: 'Brother' }
+  ]);
+  const [newContactName, setNewContactName] = useState('');
+  const [newContactPhone, setNewContactPhone] = useState('');
+  const [shakeEnabled, setShakeEnabled] = useState(true);
+
+  // 1. Setup Network and Shake Monitoring on Mount
+  useEffect(() => {
+    getNetworkState().then(setNetworkStatus);
+    const unsubscribeNet = subscribeToNetworkState((mode) => setNetworkStatus(mode));
+
+    if (shakeEnabled && sosState === 'IDLE') {
+      startShakeDetection((type) => {
+        triggerSOS(type);
+      });
+    }
+
+    return () => {
+      unsubscribeNet();
+      stopShakeDetection();
+    };
+  }, [shakeEnabled, sosState]);
+
+  // 2. Multi-Modal SOS Trigger Pipeline
+  const triggerSOS = async (triggerType = 'BUTTON') => {
+    if (sosState !== 'IDLE' && sosState !== 'RESOLVED') return;
+
+    setSosState('TRIGGERED');
+    console.log(`[SOS] Initiating emergency trigger: ${triggerType}`);
+
+    try {
+      // Step A: Acquire current GPS position
+      const gps = await getCurrentGPSPosition();
+      setCurrentCoords(gps);
+
+      // Step B: Assess Network Adaptation State
+      const netMode = await getNetworkState();
+      setNetworkStatus(netMode);
+      setSosState('SENDING');
+
+      let sessionId = `sos_${Date.now()}`;
+      setActiveSessionId(sessionId);
+
+      // Step C: If Online, dispatch to Realtime Gateway & Backend
+      if (netMode === 'ONLINE') {
+        try {
+          const res = await fetch(`${BACKEND_URL}/api/sos/trigger`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              victimUid: userProfile.uid,
+              victimName: userProfile.name,
+              victimPhone: userProfile.phone,
+              triggerType,
+              networkStateAtTrigger: 'ONLINE',
+              latitude: gps.latitude,
+              longitude: gps.longitude
+            })
+          });
+          const data = await res.json();
+          if (data.sessionId) sessionId = data.sessionId;
+        } catch (backendErr) {
+          console.warn('[SOS] Backend unreachable, proceeding with client sync:', backendErr.message);
+        }
+      }
+
+      // Step D: Trigger Phase 1 SMS Fallback (Share-Sheet) if offline or poor connectivity
+      if (netMode === 'OFFLINE' || netMode === 'POOR') {
+        const recipientPhones = contacts.map(c => c.phone);
+        const alertMsg = buildEmergencyMessage(userProfile.name, gps.latitude, gps.longitude);
+        await sendEmergencySMSPhase1(recipientPhones, alertMsg);
+      }
+
+      // Step E: Escalation of Sensors (Continuous GPS Tracking & Chunk Evidence Recording)
+      startContinuousLocationTracking((ping) => {
+        setCurrentCoords(ping);
+      });
+      startEvidenceRecording(sessionId);
+
+      setSosState('CONFIRMED');
+    } catch (err) {
+      Alert.alert('SOS Trigger Error', err.message);
+      setSosState('IDLE');
+    }
+  };
+
+  // 3. Resolve / Cancel Active SOS
+  const resolveSOS = async () => {
+    stopContinuousLocationTracking();
+    if (activeSessionId) {
+      await stopEvidenceRecording(activeSessionId);
+      try {
+        await fetch(`${BACKEND_URL}/api/sos/resolve`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            sessionId: activeSessionId,
+            victimUid: userProfile.uid
+          })
+        });
+      } catch (e) {}
+    }
+    setSosState('RESOLVED');
+    setTimeout(() => setSosState('IDLE'), 2000);
+    Alert.alert('SOS Deactivated', 'Emergency session safely resolved.');
+  };
+
+  const addContact = () => {
+    if (!newContactName || !newContactPhone) {
+      Alert.alert('Required', 'Please enter both contact name and phone number.');
+      return;
+    }
+    setContacts([...contacts, { id: `c_${Date.now()}`, name: newContactName, phone: newContactPhone }]);
+    setNewContactName('');
+    setNewContactPhone('');
+  };
+
+  const isSOSActive = sosState === 'TRIGGERED' || sosState === 'SENDING' || sosState === 'CONFIRMED';
+
+  return (
+    <SafeAreaView style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#0a0e17" />
+      
+      {/* Header */}
+      <View style={styles.header}>
+        <View style={styles.brandGroup}>
+          <Shield size={28} color="#ef4444" />
+          <Text style={styles.brandTitle}>SafeGuard</Text>
+        </View>
+        <View style={[styles.networkBadge, networkStatus === 'ONLINE' ? styles.netOnline : styles.netOffline]}>
+          <Wifi size={12} color="#fff" />
+          <Text style={styles.networkText}>{networkStatus}</Text>
+        </View>
+      </View>
+
+      <ScrollView contentContainerStyle={styles.scrollContent}>
+        {/* Main SOS Trigger Action */}
+        <View style={styles.sosCard}>
+          <Text style={styles.sosPrompt}>
+            {isSOSActive ? 'EMERGENCY TRANSMISSION ACTIVE' : 'PRESS OR SHAKE TO SEND SOS'}
+          </Text>
+
+          <TouchableOpacity
+            activeOpacity={0.8}
+            onPress={() => (isSOSActive ? resolveSOS() : triggerSOS('BUTTON'))}
+            style={[styles.sosButton, isSOSActive ? styles.sosButtonActive : styles.sosButtonIdle]}
+          >
+            <Radio size={54} color="#fff" />
+            <Text style={styles.sosButtonText}>
+              {isSOSActive ? 'CANCEL SOS' : 'SOS'}
+            </Text>
+          </TouchableOpacity>
+
+          <Text style={styles.sosSubtext}>
+            {isSOSActive
+              ? `State: ${sosState} • Streaming GPS Coordinates`
+              : 'Auto-detects Offline Mode & launches SMS Fallback'}
+          </Text>
+        </View>
+
+        {/* Live GPS Coordinates Banner */}
+        {currentCoords && (
+          <View style={styles.coordsCard}>
+            <View style={styles.coordRow}>
+              <Navigation size={16} color="#06b6d4" />
+              <Text style={styles.coordTitle}>Last Location Ping:</Text>
+            </View>
+            <Text style={styles.coordText}>
+              LAT: {currentCoords.latitude?.toFixed(6)} | LNG: {currentCoords.longitude?.toFixed(6)}
+            </Text>
+          </View>
+        )}
+
+        {/* Emergency Contacts Section */}
+        <View style={styles.sectionCard}>
+          <View style={styles.sectionHeader}>
+            <Phone size={18} color="#f87171" />
+            <Text style={styles.sectionTitle}>Emergency Contacts ({contacts.length})</Text>
+          </View>
+
+          {contacts.map((c) => (
+            <View key={c.id} style={styles.contactItem}>
+              <User size={18} color="#9ca3af" />
+              <View style={{ flex: 1, marginLeft: 10 }}>
+                <Text style={styles.contactName}>{c.name}</Text>
+                <Text style={styles.contactPhone}>{c.phone}</Text>
+              </View>
+              <CheckCircle size={16} color="#10b981" />
+            </View>
+          ))}
+
+          {/* Add Contact Form */}
+          <View style={styles.addContactBox}>
+            <TextInput
+              placeholder="Contact Name (e.g. Dad)"
+              placeholderTextColor="#6b7280"
+              value={newContactName}
+              onChangeText={setNewContactName}
+              style={styles.input}
+            />
+            <TextInput
+              placeholder="Phone Number (+91...)"
+              placeholderTextColor="#6b7280"
+              keyboardType="phone-pad"
+              value={newContactPhone}
+              onChangeText={setNewContactPhone}
+              style={styles.input}
+            />
+            <TouchableOpacity onPress={addContact} style={styles.addBtn}>
+              <Text style={styles.addBtnText}>+ Add Emergency Contact</Text>
+            </TouchableOpacity>
+          </View>
+        </View>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: {
+    flex: 1,
+    backgroundColor: '#0a0e17'
+  },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: 'rgba(255, 255, 255, 0.08)'
+  },
+  brandGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8
+  },
+  brandTitle: {
+    fontSize: 22,
+    fontWeight: '800',
+    color: '#ffffff',
+    letterSpacing: -0.5
+  },
+  networkBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 20
+  },
+  netOnline: {
+    backgroundColor: 'rgba(16, 185, 129, 0.2)',
+    borderColor: 'rgba(16, 185, 129, 0.5)',
+    borderWidth: 1
+  },
+  netOffline: {
+    backgroundColor: 'rgba(239, 68, 68, 0.2)',
+    borderColor: 'rgba(239, 68, 68, 0.5)',
+    borderWidth: 1
+  },
+  networkText: {
+    color: '#ffffff',
+    fontSize: 11,
+    fontWeight: '700'
+  },
+  scrollContent: {
+    padding: 20
+  },
+  sosCard: {
+    alignItems: 'center',
+    paddingVertical: 30,
+    backgroundColor: 'rgba(26, 34, 52, 0.6)',
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)',
+    marginBottom: 20
+  },
+  sosPrompt: {
+    color: '#9ca3af',
+    fontSize: 12,
+    fontWeight: '700',
+    letterSpacing: 1,
+    marginBottom: 20
+  },
+  sosButton: {
+    width: 170,
+    height: 170,
+    borderRadius: 85,
+    alignItems: 'center',
+    justifyContent: 'center',
+    elevation: 10,
+    shadowColor: '#ef4444',
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.5,
+    shadowRadius: 15
+  },
+  sosButtonIdle: {
+    backgroundColor: '#ef4444'
+  },
+  sosButtonActive: {
+    backgroundColor: '#10b981'
+  },
+  sosButtonText: {
+    color: '#ffffff',
+    fontSize: 20,
+    fontWeight: '900',
+    marginTop: 6
+  },
+  sosSubtext: {
+    color: '#9ca3af',
+    fontSize: 12,
+    marginTop: 20
+  },
+  coordsCard: {
+    backgroundColor: 'rgba(6, 182, 212, 0.1)',
+    borderWidth: 1,
+    borderColor: 'rgba(6, 182, 212, 0.3)',
+    borderRadius: 14,
+    padding: 14,
+    marginBottom: 20
+  },
+  coordRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginBottom: 4
+  },
+  coordTitle: {
+    color: '#06b6d4',
+    fontSize: 12,
+    fontWeight: '700'
+  },
+  coordText: {
+    color: '#ffffff',
+    fontFamily: 'monospace',
+    fontSize: 13
+  },
+  sectionCard: {
+    backgroundColor: 'rgba(26, 34, 52, 0.6)',
+    borderRadius: 20,
+    padding: 18,
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.08)'
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    marginBottom: 14
+  },
+  sectionTitle: {
+    color: '#ffffff',
+    fontSize: 15,
+    fontWeight: '700'
+  },
+  contactItem: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(255, 255, 255, 0.03)',
+    borderRadius: 12,
+    padding: 12,
+    marginBottom: 8
+  },
+  contactName: {
+    color: '#ffffff',
+    fontSize: 14,
+    fontWeight: '600'
+  },
+  contactPhone: {
+    color: '#9ca3af',
+    fontSize: 12
+  },
+  addContactBox: {
+    marginTop: 10,
+    borderTopWidth: 1,
+    borderTopColor: 'rgba(255, 255, 255, 0.06)',
+    paddingTop: 12
+  },
+  input: {
+    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.1)',
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    color: '#ffffff',
+    fontSize: 13,
+    marginBottom: 8
+  },
+  addBtn: {
+    backgroundColor: 'rgba(99, 102, 241, 0.2)',
+    borderWidth: 1,
+    borderColor: 'rgba(99, 102, 241, 0.4)',
+    borderRadius: 10,
+    paddingVertical: 10,
+    alignItems: 'center'
+  },
+  addBtnText: {
+    color: '#a5b4fc',
+    fontWeight: '700',
+    fontSize: 13
+  }
+});
