@@ -24,8 +24,8 @@ import { startShakeDetection, stopShakeDetection, startVoiceDetection, stopVoice
 import { BACKEND_URL } from './src/config/firebaseConfig';
 
 export default function App() {
-  // Auth & Onboarding State
-  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  // Auth & Onboarding State - Default to true for instant direct launch
+  const [isAuthenticated, setIsAuthenticated] = useState(true);
   const [phoneInput, setPhoneInput] = useState('+919876543210');
   const [otpInput, setOtpInput] = useState('123456');
   const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
