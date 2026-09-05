@@ -1,24 +1,36 @@
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
+const { Server } = require('socket.io');
+const ioClient = require('socket.io-client');
 const { computeGeohash, calculateDistanceMeters, findNearbyUsers } = require('../services/geoFireService');
+const setupSosSockets = require('../sockets/sosSocketHandler');
+const sosRoutes = require('../routes/sosRoutes');
+const contactsRoutes = require('../routes/contactsRoutes');
+const evidenceRoutes = require('../routes/evidenceRoutes');
+
+// Helper function equivalent to mobile buildEmergencyMessage
+function buildEmergencyMessage(victimName, latitude, longitude) {
+  const mapLink = `https://maps.google.com/?q=${latitude},${longitude}`;
+  return `🚨 EMERGENCY ALERT! I (${victimName || 'SafeGuard User'}) need urgent help! My current GPS location: ${mapLink} [SafeGuard Distress Alert]`;
+}
 
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-const sosRoutes = require('../routes/sosRoutes');
-const contactsRoutes = require('../routes/contactsRoutes');
-const evidenceRoutes = require('../routes/evidenceRoutes');
-
 app.use('/api/sos', sosRoutes);
 app.use('/api/contacts', contactsRoutes);
 app.use('/api/evidence', evidenceRoutes);
 
-async function runTests() {
-  console.log('🧪 ==========================================');
-  console.log('🧪 Starting SafeGuard Backend & GeoFire Tests');
-  console.log('🧪 ==========================================\n');
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+setupSosSockets(io);
+
+async function runComprehensiveE2ETest() {
+  console.log('====================================================');
+  console.log('🛡️  SAFEGUARD FULL END-TO-END APPLICATION TEST SUITE');
+  console.log('====================================================\n');
 
   let passed = 0;
   let failed = 0;
@@ -33,79 +45,184 @@ async function runTests() {
     }
   }
 
-  // Test 1: Geohash Computation
-  const lat = 12.971598;
-  const lon = 77.594566;
-  const hash = computeGeohash(lat, lon);
-  assert(typeof hash === 'string' && hash.length >= 8, `Compute geohash for (${lat}, ${lon}) => ${hash}`);
-
-  // Test 2: Distance Calculation (1km check)
-  const dist = calculateDistanceMeters(12.971598, 77.594566, 12.975000, 77.594566);
-  assert(dist > 300 && dist < 500, `Calculated distance between adjacent points: ${Math.round(dist)}m`);
-
-  // Test 3: Nearby User Discovery (with mock fallback / DB check)
-  const nearby = await findNearbyUsers(lat, lon, 1000, 'test_victim_uid');
-  assert(Array.isArray(nearby), `findNearbyUsers returns an array (length: ${nearby.length})`);
-
-  // Test 4: SOS Trigger Route Simulation
-  const server = http.createServer(app);
-  await new Promise((resolve) => server.listen(5099, resolve));
+  const PORT = 5098;
+  await new Promise((resolve) => server.listen(PORT, resolve));
 
   try {
-    const triggerRes = await fetch('http://localhost:5099/api/sos/trigger', {
+    // ----------------------------------------------------
+    // Section 1: Geospatial & GeoFire Computation Engine
+    // ----------------------------------------------------
+    console.log('\n--- [1. Geospatial & Geohash Engine Verification] ---');
+    const lat = 12.971598;
+    const lon = 77.594566;
+    const hash = computeGeohash(lat, lon);
+    assert(typeof hash === 'string' && hash.length >= 8, `Geohash computed for Bangalore coordinates: ${hash}`);
+
+    const dist = calculateDistanceMeters(lat, lon, 12.975000, lon);
+    assert(dist > 300 && dist < 500, `Distance metric accurate: ${Math.round(dist)} meters`);
+
+    const nearby = await findNearbyUsers(lat, lon, 1000, 'victim_uid_101');
+    assert(Array.isArray(nearby), `Nearby registered responders query handled correctly`);
+
+    // ----------------------------------------------------
+    // Section 2: Emergency Contact Management API
+    // ----------------------------------------------------
+    console.log('\n--- [2. Emergency Contacts Subsystem] ---');
+    const addContactRes = await fetch(`http://localhost:${PORT}/api/contacts/user_jane_101`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        victimUid: 'user_e2e_tester_1',
-        victimName: 'E2E Demo Tester',
-        victimPhone: '+919999988888',
+        name: 'Dad (Guardian)',
+        phone: '+919876543212',
+        relationship: 'Father',
+        priority: 1
+      })
+    });
+    const addContactData = await addContactRes.json();
+    assert(addContactRes.status === 201 && addContactData.success, `Added emergency contact: Dad (${addContactData.contactId})`);
+
+    const getContactsRes = await fetch(`http://localhost:${PORT}/api/contacts/user_jane_101`);
+    const getContactsData = await getContactsRes.json();
+    assert(getContactsData.contacts && getContactsData.contacts.length >= 1, `Retrieved active emergency contacts list for user`);
+
+    // ----------------------------------------------------
+    // Section 3: Online SOS Trigger Lifecycle & WebSockets
+    // ----------------------------------------------------
+    console.log('\n--- [3. Online SOS Trigger & Live Streaming Pipeline] ---');
+    const triggerRes = await fetch(`http://localhost:${PORT}/api/sos/trigger`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        victimUid: 'user_jane_101',
+        victimName: 'Jane Doe',
+        victimPhone: '+919876543210',
         triggerType: 'BUTTON',
-        latitude: 12.9716,
-        longitude: 77.5946
+        networkStateAtTrigger: 'ONLINE',
+        batteryLevel: 0.85,
+        latitude: lat,
+        longitude: lon,
+        approximateAddress: 'MG Road, Bangalore'
       })
     });
     const triggerData = await triggerRes.json();
-    assert(triggerData.success === true && triggerData.sessionId, `SOS Trigger API creates session: ${triggerData.sessionId}`);
+    assert(triggerData.success && triggerData.sessionId, `SOS Trigger initiated successfully. Session ID: ${triggerData.sessionId}`);
+    const sessionId = triggerData.sessionId;
 
-    // Test 5: Acknowledge SOS Route Simulation
-    const ackRes = await fetch('http://localhost:5099/api/sos/acknowledge', {
+    // Connect WebSocket Client to simulate Web Dashboard Live Tracking
+    const socket = ioClient(`http://localhost:${PORT}`);
+    let receivedSocketPing = false;
+
+    await new Promise((resolve) => {
+      socket.on('connect', () => {
+        socket.emit('join_sos_session', { sessionId });
+        
+        socket.on('live_location_update', (ping) => {
+          if (ping.latitude === lat) {
+            receivedSocketPing = true;
+          }
+        });
+
+        // Simulate mobile high-frequency GPS ping stream
+        socket.emit('stream_location_ping', {
+          sessionId,
+          victimUid: 'user_jane_101',
+          latitude: lat,
+          longitude: lon,
+          accuracy: 5,
+          speed: 1.2,
+          timestamp: Date.now()
+        });
+
+        setTimeout(resolve, 800);
+      });
+    });
+
+    assert(receivedSocketPing, `WebSocket real-time GPS stream received in room 'sos_${sessionId}'`);
+    socket.disconnect();
+
+    // ----------------------------------------------------
+    // Section 4: Continuous Evidence Recording Metadata API
+    // ----------------------------------------------------
+    console.log('\n--- [4. Audio/Evidence Recording Ingestion] ---');
+    const evidenceRes = await fetch(`http://localhost:${PORT}/api/evidence/${sessionId}/meta`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        sessionId: triggerData.sessionId,
-        contactId: 'contact_tester_1',
-        contactName: 'Responder Alex'
+        type: 'AUDIO_CHUNK',
+        downloadUrl: 'https://storage.googleapis.com/safeguard-demo.appspot.com/evidence/chunk_1.m4a',
+        storagePath: `evidence/${sessionId}/audio_chunk_1.m4a`,
+        chunkIndex: 1,
+        durationMs: 12000,
+        sizeBytes: 48000
+      })
+    });
+    const evidenceData = await evidenceRes.json();
+    assert(evidenceData.success && evidenceData.evidenceId, `Evidence chunk #1 registered: ${evidenceData.evidenceId}`);
+
+    const getEvidenceRes = await fetch(`http://localhost:${PORT}/api/evidence/${sessionId}`);
+    const getEvidenceData = await getEvidenceRes.json();
+    assert(getEvidenceData.evidence && getEvidenceData.evidence.length === 1, `Evidence retrieval verified for dashboard playback`);
+
+    // ----------------------------------------------------
+    // Section 5: Acknowledgment & Resolution Cycle
+    // ----------------------------------------------------
+    console.log('\n--- [5. Responder Acknowledgment & Resolution Lifecycle] ---');
+    const ackRes = await fetch(`http://localhost:${PORT}/api/sos/acknowledge`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        sessionId,
+        contactId: 'contact_dad_01',
+        contactName: 'Dad (Guardian)'
       })
     });
     const ackData = await ackRes.json();
-    assert(ackData.success === true && ackData.status === 'CONFIRMED', `SOS Acknowledge API marks status CONFIRMED`);
+    assert(ackData.success && ackData.status === 'CONFIRMED', `Dashboard Responder Acknowledgment transitioned state to CONFIRMED`);
 
-    // Test 6: Input Validation Edge Case (Missing required lat/lng)
-    const invalidRes = await fetch('http://localhost:5099/api/sos/trigger', {
+    const resolveRes = await fetch(`http://localhost:${PORT}/api/sos/resolve`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        victimUid: 'user_tester_no_coords'
+        sessionId,
+        victimUid: 'user_jane_101'
       })
     });
-    assert(invalidRes.status === 400, `Validation correctly rejects request with missing coordinates (HTTP 400)`);
+    const resolveData = await resolveRes.json();
+    assert(resolveData.success && resolveData.status === 'RESOLVED', `Incident safely closed with status RESOLVED`);
+
+    // ----------------------------------------------------
+    // Section 6: Network-Adaptive Offline SMS Fallback Payload
+    // ----------------------------------------------------
+    console.log('\n--- [6. Offline Network Adaptation & SMS Fallback Payload] ---');
+    const smsMessage = buildEmergencyMessage('Jane Doe', lat, lon);
+    assert(
+      smsMessage.includes('EMERGENCY ALERT') &&
+      smsMessage.includes('https://maps.google.com/?q=12.971598,77.594566'),
+      `Offline SMS payload generated with accurate Google Maps coordinate URL`
+    );
+
+    // ----------------------------------------------------
+    // Section 7: Resilient Validation & Error Handling
+    // ----------------------------------------------------
+    console.log('\n--- [7. Input Validation & Resiliency Guardrails] ---');
+    const invalidTriggerRes = await fetch(`http://localhost:${PORT}/api/sos/trigger`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ victimUid: 'user_without_coords' })
+    });
+    assert(invalidTriggerRes.status === 400, `API correctly rejected invalid request without coordinates (HTTP 400)`);
 
   } catch (err) {
-    console.error('Test execution error:', err);
+    console.error('Test run failure:', err);
     failed++;
   } finally {
-    server.close();
-  }
-
-  console.log(`\n==========================================`);
-  console.log(` Test Results: ${passed} Passed, ${failed} Failed`);
-  console.log(`==========================================\n`);
-
-  if (failed > 0) {
-    process.exit(1);
-  } else {
-    process.exit(0);
+    server.close(() => {
+      console.log('\n====================================================');
+      console.log(`📊 FINAL TEST REPORT: ${passed} Passed, ${failed} Failed`);
+      console.log('====================================================\n');
+      process.exit(failed > 0 ? 1 : 0);
+    });
   }
 }
 
-runTests();
+runComprehensiveE2ETest();

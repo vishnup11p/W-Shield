@@ -1,3 +1,5 @@
+import { Buffer } from 'buffer';
+global.Buffer = Buffer;
 import React, { useState, useEffect } from 'react';
 import {
   StyleSheet,

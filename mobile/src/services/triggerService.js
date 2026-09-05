@@ -12,22 +12,31 @@ let voicePollingTimer = null;
 /**
  * Starts accelerometer listener for rapid shake triggers
  */
-export function startShakeDetection(onShakeTrigger) {
-  Accelerometer.setUpdateInterval(120);
-
-  shakeSubscription = Accelerometer.addListener(accelerometerData => {
-    const { x, y, z } = accelerometerData;
-    const acceleration = Math.sqrt(x * x + y * y + z * z);
-
-    if (acceleration > SHAKE_THRESHOLD) {
-      const now = Date.now();
-      if (now - lastShakeTime > DEBOUNCE_MS) {
-        lastShakeTime = now;
-        console.log('[Trigger] Valid intentional shake detected! Force magnitude:', acceleration.toFixed(2));
-        onShakeTrigger('SHAKE');
-      }
+export async function startShakeDetection(onShakeTrigger) {
+  try {
+    const isAvailable = await Accelerometer.isAvailableAsync();
+    if (!isAvailable) {
+      console.log('[Trigger] Accelerometer sensor is not available on this device');
+      return;
     }
-  });
+    Accelerometer.setUpdateInterval(120);
+
+    shakeSubscription = Accelerometer.addListener(accelerometerData => {
+      const { x = 0, y = 0, z = 0 } = accelerometerData || {};
+      const acceleration = Math.sqrt(x * x + y * y + z * z);
+
+      if (acceleration > SHAKE_THRESHOLD) {
+        const now = Date.now();
+        if (now - lastShakeTime > DEBOUNCE_MS) {
+          lastShakeTime = now;
+          console.log('[Trigger] Valid intentional shake detected! Force magnitude:', acceleration.toFixed(2));
+          onShakeTrigger('SHAKE');
+        }
+      }
+    });
+  } catch (err) {
+    console.warn('[Trigger] Accelerometer listener error:', err.message);
+  }
 }
 
 export function stopShakeDetection() {
