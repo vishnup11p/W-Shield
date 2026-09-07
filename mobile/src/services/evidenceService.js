@@ -1,4 +1,4 @@
-import { Audio } from 'expo-av';
+import { Audio } from './expoAvMock';
 import { ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import { storage, BACKEND_URL } from '../config/firebaseConfig';
 import { Platform } from 'react-native';
@@ -9,6 +9,10 @@ let chunkCounter = 1;
 let isRecordingActive = false;
 
 export async function requestAudioPermissions() {
+  if (!Audio || typeof Audio.requestPermissionsAsync !== 'function') {
+    console.warn('[Evidence] Audio permissions skipped: Audio native module not loaded');
+    return false;
+  }
   const { status } = await Audio.requestPermissionsAsync();
   if (status !== 'granted') {
     throw new Error('Audio recording permission was denied');
@@ -21,6 +25,10 @@ export async function requestAudioPermissions() {
  */
 export async function startEvidenceRecording(sessionId) {
   if (isRecordingActive) return;
+  if (!Audio || typeof Audio.setAudioModeAsync !== 'function') {
+    console.warn('[Evidence] Audio recording skipped: Native Audio module not available in this client.');
+    return false;
+  }
   
   try {
     await requestAudioPermissions();

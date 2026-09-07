@@ -7,6 +7,7 @@ const { Server } = require('socket.io');
 const sosRoutes = require('./routes/sosRoutes');
 const contactsRoutes = require('./routes/contactsRoutes');
 const evidenceRoutes = require('./routes/evidenceRoutes');
+const authRoutes = require('./routes/authRoutes');
 const setupSosSockets = require('./sockets/sosSocketHandler');
 
 const app = express();
@@ -24,6 +25,7 @@ app.use(cors());
 app.use(express.json());
 
 // Routes
+app.use('/auth', authRoutes);
 app.use('/api/sos', sosRoutes);
 app.use('/api/contacts', contactsRoutes);
 app.use('/api/evidence', evidenceRoutes);

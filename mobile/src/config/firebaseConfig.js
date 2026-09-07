@@ -1,7 +1,5 @@
 import { initializeApp, getApps } from 'firebase/app';
-import { getDatabase } from 'firebase/database';
-import { getAuth } from 'firebase/auth';
-import { getStorage } from 'firebase/storage';
+import { getStorage, ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
 import Constants from 'expo-constants';
 
 const firebaseConfig = {
@@ -21,7 +19,17 @@ if (!getApps().length) {
   app = getApps()[0];
 }
 
-export const db = getDatabase(app);
-export const auth = getAuth(app);
-export const storage = getStorage(app);
+let db = null;
+let auth = null;
+let storage = null;
+
+try {
+  if (app) {
+    storage = getStorage(app);
+  }
+} catch (e) {
+  console.warn('[Firebase] Storage init warning:', e.message);
+}
+
+export { db, auth, storage };
 export const BACKEND_URL = process.env.EXPO_PUBLIC_BACKEND_URL || "http://10.0.2.2:5000";

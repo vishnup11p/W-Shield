@@ -1,679 +1,440 @@
+// SafeGuard — Network-Adaptive Women Safety System
+// Root Router: wires all screens, state, and services together.
+
 import { Buffer } from 'buffer';
 global.Buffer = Buffer;
-import React, { useState, useEffect } from 'react';
-import {
-  StyleSheet,
-  Text,
-  View,
-  TouchableOpacity,
-  SafeAreaView,
-  StatusBar,
-  ScrollView,
-  TextInput,
-  Alert,
-  ActivityIndicator,
-  Switch
-} from 'react-native';
-import { Shield, Radio, Phone, User, CheckCircle, AlertTriangle, Wifi, Navigation, Mic, Activity } from 'lucide-react-native';
 
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+import { Alert, AppState } from 'react-native';
+
+// Screens
+import AuthScreen from './src/screens/AuthScreen';
+import HomeScreen from './src/screens/HomeScreen';
+import EmergencyActiveScreen from './src/screens/EmergencyActiveScreen';
+import ContactsScreen from './src/screens/ContactsScreen';
+import EvidenceScreen from './src/screens/EvidenceScreen';
+import HistoryScreen from './src/screens/HistoryScreen';
+import ProfileScreen from './src/screens/ProfileScreen';
+import SettingsScreen from './src/screens/SettingsScreen';
+
+// Services
 import { getCurrentGPSPosition, startContinuousLocationTracking, stopContinuousLocationTracking } from './src/services/locationService';
 import { getNetworkState, subscribeToNetworkState } from './src/services/netinfoService';
 import { sendEmergencySMSPhase1, sendEmergencySMSPhase2, buildEmergencyMessage } from './src/services/smsFallbackService';
 import { startEvidenceRecording, stopEvidenceRecording } from './src/services/evidenceService';
 import { startShakeDetection, stopShakeDetection, startVoiceDetection, stopVoiceDetection } from './src/services/triggerService';
+import { connectSocket, streamLocationPing, disconnectSocket, isSocketConnected } from './src/services/socketService';
+import {
+  getAuthSession, getUserProfile, getContacts, getSettings,
+  saveContacts, saveSettings, saveActiveSession, clearActiveSession,
+  appendToHistory, getActiveSession
+} from './src/services/storageService';
+import { onAuthChange } from './src/services/authService';
 import { BACKEND_URL } from './src/config/firebaseConfig';
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SOS States:  IDLE → COUNTDOWN → TRIGGERED → SENDING → CONFIRMED → RESOLVED
+// ─────────────────────────────────────────────────────────────────────────────
+
 export default function App() {
-  // Auth & Onboarding State - Default to true for instant direct launch
-  const [isAuthenticated, setIsAuthenticated] = useState(true);
-  const [phoneInput, setPhoneInput] = useState('+919876543210');
-  const [otpInput, setOtpInput] = useState('123456');
-  const [isVerifyingOtp, setIsVerifyingOtp] = useState(false);
+  // ─── Auth ───────────────────────────────────────────────────────────────
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [authLoading, setAuthLoading] = useState(true);
+  const [userProfile, setUserProfile] = useState(null);
 
-  // App & SOS State
+  // ─── Navigation ─────────────────────────────────────────────────────────
+  const [currentScreen, setCurrentScreen] = useState('Home');
+  const [screenParams, setScreenParams] = useState({});
+
+  const navigate = useCallback((screen, params = {}) => {
+    setCurrentScreen(screen);
+    setScreenParams(params);
+  }, []);
+
+  // ─── App State ──────────────────────────────────────────────────────────
   const [networkStatus, setNetworkStatus] = useState('ONLINE');
-  const [sosState, setSosState] = useState('IDLE'); // IDLE | TRIGGERED | SENDING | CONFIRMED | ESCALATED | RESOLVED
-  const [activeSessionId, setActiveSessionId] = useState(null);
   const [currentCoords, setCurrentCoords] = useState(null);
-  const [userProfile, setUserProfile] = useState({
-    uid: 'user_jane_doe_101',
-    name: 'Jane Doe',
-    phone: '+919876543210'
+  const [contacts, setContacts] = useState([]);
+  const [settings, setSettings] = useState({
+    shakeEnabled: true,
+    voiceEnabled: false,
+    fallDetectionEnabled: false,
+    countdownSeconds: 5,
+    smsPhase2Enabled: false,
+    evidenceRecordingEnabled: true,
+    locationSharingEnabled: true,
   });
-  const [contacts, setContacts] = useState([
-    { id: 'c1', name: 'Mom', phone: '+919876543210', relationship: 'Mother' },
-    { id: 'c2', name: 'Alex (Brother)', phone: '+919876543211', relationship: 'Brother' }
-  ]);
-  const [newContactName, setNewContactName] = useState('');
-  const [newContactPhone, setNewContactPhone] = useState('');
-  
-  // Feature Toggles
-  const [shakeEnabled, setShakeEnabled] = useState(true);
-  const [voiceEnabled, setVoiceEnabled] = useState(false);
-  const [usePhase2SMS, setUsePhase2SMS] = useState(false);
-  const [simulatingOffline, setSimulatingOffline] = useState(false);
 
-  // 1. Setup Network and Multi-Modal Listeners on Mount
+  // ─── SOS State ──────────────────────────────────────────────────────────
+  const [sosState, setSosState] = useState('IDLE');
+  const [activeSessionId, setActiveSessionId] = useState(null);
+  const [countdown, setCountdown] = useState(5);
+  const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [recordingStatus, setRecordingStatus] = useState('IDLE');
+  const [nearbyCount, setNearbyCount] = useState(0);
+
+  const countdownRef = useRef(null);
+  const elapsedRef = useRef(null);
+  const countdownValueRef = useRef(5);
+
+  // ─── Boot Sequence ───────────────────────────────────────────────────────
   useEffect(() => {
-    getNetworkState().then((state) => {
-      if (!simulatingOffline) setNetworkStatus(state);
-    });
+    let authUnsub = () => {};
+    const boot = async () => {
+      try {
+        // 1. Load cached session + profile
+        const session = await getAuthSession();
+        const profile = await getUserProfile();
+        const savedContacts = await getContacts();
+        const savedSettings = await getSettings();
 
-    const unsubscribeNet = subscribeToNetworkState((mode) => {
-      if (!simulatingOffline) setNetworkStatus(mode);
-    });
+        if (savedContacts.length > 0) setContacts(savedContacts);
+        if (savedSettings) setSettings(savedSettings);
 
-    if (shakeEnabled && sosState === 'IDLE') {
-      startShakeDetection((type) => triggerSOS(type));
+        // 2. Check for interrupted active session
+        const activeSession = await getActiveSession();
+        if (activeSession && activeSession.sessionId) {
+          setActiveSessionId(activeSession.sessionId);
+          setSosState('CONFIRMED');
+        }
+
+        if (session?.uid && profile) {
+          setUserProfile(profile);
+          setIsAuthenticated(true);
+        }
+      } catch (e) {
+        console.warn('[Boot] Initialization error:', e.message);
+      } finally {
+        setAuthLoading(false);
+      }
+
+      // 3. Watch Firebase Auth state changes
+      authUnsub = onAuthChange(async (firebaseUser) => {
+        if (!firebaseUser) {
+          // Firebase signed out — but we still allow local demo sessions
+          const session = await getAuthSession();
+          const profile = await getUserProfile();
+          if (!session || !profile) {
+            setIsAuthenticated(false);
+            setUserProfile(null);
+          }
+        }
+      });
+    };
+
+    boot();
+    return () => authUnsub();
+  }, []);
+
+  // ─── Network Listener ────────────────────────────────────────────────────
+  useEffect(() => {
+    getNetworkState().then(setNetworkStatus);
+    const unsub = subscribeToNetworkState((mode) => setNetworkStatus(mode));
+    return () => unsub();
+  }, []);
+
+  // ─── Shake + Voice + Fall Detection ──────────────────────────────────────
+  useEffect(() => {
+    if (sosState !== 'IDLE') return;
+
+    if (settings.shakeEnabled) {
+      startShakeDetection((type) => {
+        console.log('[App] Shake trigger received');
+        triggerSOS('SHAKE');
+      });
     }
 
-    if (voiceEnabled && sosState === 'IDLE') {
-      startVoiceDetection((type) => triggerSOS(type));
+    if (settings.voiceEnabled) {
+      startVoiceDetection((type) => {
+        console.log('[App] Voice trigger received');
+        triggerSOS('VOICE');
+      });
     }
 
     return () => {
-      unsubscribeNet();
       stopShakeDetection();
       stopVoiceDetection();
     };
-  }, [shakeEnabled, voiceEnabled, sosState, simulatingOffline]);
+  }, [settings.shakeEnabled, settings.voiceEnabled, sosState]);
 
-  // Handle Phone / OTP Login
-  const handleVerifyOtp = () => {
-    if (!phoneInput || !otpInput) {
-      Alert.alert('Required', 'Please enter your phone number and 6-digit OTP code.');
-      return;
+  // ─── Elapsed Timer ───────────────────────────────────────────────────────
+  useEffect(() => {
+    const isActive = sosState === 'TRIGGERED' || sosState === 'SENDING' || sosState === 'CONFIRMED';
+    if (isActive) {
+      elapsedRef.current = setInterval(() => {
+        setElapsedSeconds(s => s + 1);
+      }, 1000);
+    } else {
+      clearInterval(elapsedRef.current);
+      setElapsedSeconds(0);
     }
-    setIsVerifyingOtp(true);
-    setTimeout(() => {
-      setIsVerifyingOtp(false);
-      setIsAuthenticated(true);
-      setUserProfile(prev => ({ ...prev, phone: phoneInput }));
-    }, 600);
-  };
+    return () => clearInterval(elapsedRef.current);
+  }, [sosState]);
 
-  // 2. Full Multi-Modal SOS Trigger Pipeline
-  const triggerSOS = async (triggerType = 'BUTTON') => {
+  // ─── SOS PIPELINE ─────────────────────────────────────────────────────────
+
+  /**
+   * Step 1: Start countdown. Allows cancellation.
+   */
+  const triggerSOS = useCallback((triggerType = 'BUTTON') => {
     if (sosState !== 'IDLE' && sosState !== 'RESOLVED') return;
 
+    const cd = settings.countdownSeconds || 5;
+    countdownValueRef.current = cd;
+    setCountdown(cd);
+    setSosState('COUNTDOWN');
+    console.log(`[SOS] Countdown started (${cd}s), trigger: ${triggerType}`);
+
+    countdownRef.current = setInterval(() => {
+      countdownValueRef.current -= 1;
+      setCountdown(countdownValueRef.current);
+      if (countdownValueRef.current <= 0) {
+        clearInterval(countdownRef.current);
+        activateEmergency(triggerType);
+      }
+    }, 1000);
+  }, [sosState, settings.countdownSeconds]);
+
+  /**
+   * Cancel countdown before SOS fires.
+   */
+  const cancelCountdown = useCallback(() => {
+    clearInterval(countdownRef.current);
+    setSosState('IDLE');
+    setCountdown(settings.countdownSeconds || 5);
+    console.log('[SOS] Countdown cancelled by user');
+  }, [settings.countdownSeconds]);
+
+  /**
+   * Step 2: Countdown complete — execute emergency workflow.
+   */
+  const activateEmergency = async (triggerType = 'BUTTON') => {
     setSosState('TRIGGERED');
-    console.log(`[SOS TRIGGERED] Type: ${triggerType}`);
+    console.log(`[SOS] EMERGENCY ACTIVATED — type: ${triggerType}`);
 
     try {
-      // Step A: Acquire Real GPS Coordinates
-      const gps = await getCurrentGPSPosition();
-      setCurrentCoords(gps);
+      // A: Get GPS
+      let gps = null;
+      try {
+        gps = await getCurrentGPSPosition();
+        setCurrentCoords(gps);
+      } catch (gpsErr) {
+        console.warn('[SOS] GPS error:', gpsErr.message);
+        Alert.alert('GPS Unavailable', 'Could not get your location. SOS will still be sent.');
+      }
 
-      // Step B: Assess Network Adaptation State
-      const netMode = simulatingOffline ? 'OFFLINE' : await getNetworkState();
-      setNetworkStatus(netMode);
       setSosState('SENDING');
+      const lat = gps?.latitude ?? 0;
+      const lng = gps?.longitude ?? 0;
 
-      let sessionId = `sos_${Date.now()}`;
-      setActiveSessionId(sessionId);
+      // B: Assess network
+      const netMode = await getNetworkState();
+      setNetworkStatus(netMode);
 
-      // Step C: If Online, dispatch to Realtime Gateway & Backend
-      if (netMode === 'ONLINE') {
+      let sessionId = `sos_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
+      // C: If online — call backend
+      if (netMode === 'ONLINE' || netMode === 'POOR') {
         try {
           const res = await fetch(`${BACKEND_URL}/api/sos/trigger`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
-              victimUid: userProfile.uid,
-              victimName: userProfile.name,
-              victimPhone: userProfile.phone,
+              victimUid: userProfile?.uid || 'anonymous',
+              victimName: userProfile?.name || 'SafeGuard User',
+              victimPhone: userProfile?.phone || '',
               triggerType,
-              networkStateAtTrigger: 'ONLINE',
-              latitude: gps.latitude,
-              longitude: gps.longitude
-            })
+              networkStateAtTrigger: netMode,
+              latitude: lat,
+              longitude: lng,
+            }),
           });
           const data = await res.json();
           if (data.sessionId) sessionId = data.sessionId;
+          if (data.nearbyUsersCount) setNearbyCount(data.nearbyUsersCount);
         } catch (backendErr) {
-          console.warn('[SOS] Backend connection notice:', backendErr.message);
+          console.warn('[SOS] Backend unreachable, continuing with local ID:', backendErr.message);
         }
       }
 
-      // Step D: Trigger SMS Fallback (Phase 1 Share-Sheet vs Phase 2 Silent) if offline
+      // D: SMS fallback when offline or poor
+      const activeContacts = contacts.filter(c => c.enabled !== false);
       if (netMode === 'OFFLINE' || netMode === 'POOR') {
-        const recipientPhones = contacts.map(c => c.phone);
-        const alertMsg = buildEmergencyMessage(userProfile.name, gps.latitude, gps.longitude);
-        
-        if (usePhase2SMS) {
-          await sendEmergencySMSPhase2(recipientPhones, alertMsg);
-        } else {
-          await sendEmergencySMSPhase1(recipientPhones, alertMsg);
+        const phones = activeContacts.map(c => c.phone).filter(Boolean);
+        const msg = buildEmergencyMessage(userProfile?.name, lat, lng);
+        if (phones.length > 0) {
+          if (settings.smsPhase2Enabled) {
+            await sendEmergencySMSPhase2(phones, msg);
+          } else {
+            await sendEmergencySMSPhase1(phones, msg);
+          }
         }
       }
 
-      // Step E: Escalation of Sensors (High-Frequency GPS + Audio Evidence Chunking)
-      startContinuousLocationTracking((ping) => {
-        setCurrentCoords(ping);
+      // E: Set session, save to storage
+      setActiveSessionId(sessionId);
+      await saveActiveSession({
+        sessionId,
+        startedAt: Date.now(),
+        victimUid: userProfile?.uid,
+        triggerType,
+        latitude: lat,
+        longitude: lng,
       });
-      startEvidenceRecording(sessionId);
+
+      // F: Connect Socket.IO for real-time location streaming
+      if (netMode !== 'OFFLINE') {
+        connectSocket(sessionId, (status) => {
+          console.log('[Socket] Status:', status);
+        });
+      }
+
+      // G: Start continuous GPS + stream to backend
+      if (settings.locationSharingEnabled) {
+        startContinuousLocationTracking(async (ping) => {
+          setCurrentCoords(ping);
+          // Try socket first, fall back to REST
+          const sent = streamLocationPing(sessionId, userProfile?.uid, ping);
+          if (!sent) {
+            try {
+              await fetch(`${BACKEND_URL}/api/sos/${sessionId}/location`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ victimUid: userProfile?.uid, ...ping }),
+              });
+            } catch (e) { /* offline */ }
+          }
+        });
+      }
+
+      // H: Start evidence recording
+      if (settings.evidenceRecordingEnabled) {
+        const started = await startEvidenceRecording(sessionId);
+        setRecordingStatus(started ? 'RECORDING' : 'UNAVAILABLE');
+      }
 
       setSosState('CONFIRMED');
+      navigate('EmergencyActive');
+
     } catch (err) {
-      Alert.alert('GPS or Hardware Error', err.message);
+      console.error('[SOS] Emergency activation error:', err);
+      Alert.alert('SOS Error', err.message);
       setSosState('IDLE');
     }
   };
 
-  // 3. Resolve / Cancel Active SOS
-  const resolveSOS = async () => {
-    stopContinuousLocationTracking();
-    if (activeSessionId) {
-      await stopEvidenceRecording(activeSessionId);
-      try {
-        await fetch(`${BACKEND_URL}/api/sos/resolve`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            sessionId: activeSessionId,
-            victimUid: userProfile.uid
-          })
+  /**
+   * Resolve / cancel active SOS.
+   */
+  const resolveSOS = useCallback(async () => {
+    try {
+      stopContinuousLocationTracking();
+      disconnectSocket();
+
+      if (activeSessionId) {
+        await stopEvidenceRecording(activeSessionId);
+        try {
+          await fetch(`${BACKEND_URL}/api/sos/resolve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId: activeSessionId, victimUid: userProfile?.uid }),
+          });
+        } catch (e) { /* offline */ }
+
+        // Save to local history
+        await appendToHistory({
+          sessionId: activeSessionId,
+          status: 'RESOLVED',
+          startedAt: Date.now() - elapsedSeconds * 1000,
+          endedAt: Date.now(),
+          victimUid: userProfile?.uid,
         });
-      } catch (e) {}
+      }
+
+      await clearActiveSession();
+      setActiveSessionId(null);
+      setNearbyCount(0);
+      setRecordingStatus('IDLE');
+      setSosState('RESOLVED');
+      setTimeout(() => setSosState('IDLE'), 1500);
+      navigate('Home');
+
+    } catch (err) {
+      console.warn('[SOS] Resolve error:', err.message);
+      setSosState('IDLE');
     }
-    setSosState('RESOLVED');
-    setTimeout(() => setSosState('IDLE'), 2000);
-    Alert.alert('SOS Deactivated', 'Emergency session safely resolved.');
+  }, [activeSessionId, userProfile, elapsedSeconds]);
+
+  // ─── Auth Handlers ────────────────────────────────────────────────────────
+
+  const handleAuthenticated = async (profile) => {
+    setUserProfile(profile);
+    setIsAuthenticated(true);
+    navigate('Home');
   };
 
-  const addContact = () => {
-    if (!newContactName.trim() || !newContactPhone.trim()) {
-      Alert.alert('Required', 'Please enter both contact name and valid phone number.');
-      return;
-    }
-    setContacts([...contacts, { id: `c_${Date.now()}`, name: newContactName.trim(), phone: newContactPhone.trim() }]);
-    setNewContactName('');
-    setNewContactPhone('');
+  const handleLogout = () => {
+    setSosState('IDLE');
+    clearInterval(countdownRef.current);
+    setIsAuthenticated(false);
+    setUserProfile(null);
+    setCurrentScreen('Home');
   };
 
-  const isSOSActive = sosState === 'TRIGGERED' || sosState === 'SENDING' || sosState === 'CONFIRMED';
+  // ─── RENDER ──────────────────────────────────────────────────────────────
 
-  // Render Login / Onboarding Screen
-  if (!isAuthenticated) {
+  if (authLoading) {
+    // Brief splash while checking cached auth session
+    const { View, ActivityIndicator } = require('react-native');
     return (
-      <SafeAreaView style={styles.container}>
-        <StatusBar barStyle="light-content" backgroundColor="#0a0e17" />
-        <View style={styles.authWrapper}>
-          <View style={styles.authLogoBox}>
-            <Shield size={44} color="#ef4444" />
-          </View>
-          <Text style={styles.authTitle}>SafeGuard</Text>
-          <Text style={styles.authSubtitle}>Network-Adaptive Women Safety System</Text>
-
-          <View style={styles.authCard}>
-            <Text style={styles.inputLabel}>Registered Phone Number</Text>
-            <TextInput
-              style={styles.input}
-              value={phoneInput}
-              onChangeText={setPhoneInput}
-              keyboardType="phone-pad"
-              placeholder="+91..."
-              placeholderTextColor="#6b7280"
-            />
-
-            <Text style={styles.inputLabel}>Enter 6-Digit OTP</Text>
-            <TextInput
-              style={styles.input}
-              value={otpInput}
-              onChangeText={setOtpInput}
-              keyboardType="numeric"
-              maxLength={6}
-              placeholder="123456"
-              placeholderTextColor="#6b7280"
-            />
-
-            <TouchableOpacity
-              activeOpacity={0.8}
-              onPress={handleVerifyOtp}
-              style={styles.loginBtn}
-            >
-              {isVerifyingOtp ? (
-                <ActivityIndicator color="#fff" />
-              ) : (
-                <Text style={styles.loginBtnText}>Verify & Open SafeGuard</Text>
-              )}
-            </TouchableOpacity>
-          </View>
-        </View>
-      </SafeAreaView>
+      <View style={{ flex: 1, backgroundColor: '#0a0e17', alignItems: 'center', justifyContent: 'center' }}>
+        <ActivityIndicator color="#ef4444" size="large" />
+      </View>
     );
   }
 
-  return (
-    <SafeAreaView style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#0a0e17" />
-      
-      {/* Header */}
-      <View style={styles.header}>
-        <View style={styles.brandGroup}>
-          <Shield size={28} color="#ef4444" />
-          <Text style={styles.brandTitle}>SafeGuard</Text>
-        </View>
-
-        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
-          <TouchableOpacity
-            onPress={() => {
-              const next = !simulatingOffline;
-              setSimulatingOffline(next);
-              setNetworkStatus(next ? 'OFFLINE' : 'ONLINE');
-            }}
-            style={[styles.simBadge, simulatingOffline ? styles.simActive : null]}
-          >
-            <Text style={styles.simText}>{simulatingOffline ? 'DEMO: OFFLINE' : 'DEMO: ONLINE'}</Text>
-          </TouchableOpacity>
-
-          <View style={[styles.networkBadge, networkStatus === 'ONLINE' ? styles.netOnline : styles.netOffline]}>
-            <Wifi size={12} color="#fff" />
-            <Text style={styles.networkText}>{networkStatus}</Text>
-          </View>
-        </View>
-      </View>
-
-      <ScrollView contentContainerStyle={styles.scrollContent}>
-        {/* Main SOS Trigger Action */}
-        <View style={styles.sosCard}>
-          <Text style={styles.sosPrompt}>
-            {isSOSActive ? 'EMERGENCY TRANSMISSION ACTIVE' : 'PRESS, SHAKE, OR CALL OUT TO SEND SOS'}
-          </Text>
-
-          <TouchableOpacity
-            activeOpacity={0.8}
-            onPress={() => (isSOSActive ? resolveSOS() : triggerSOS('BUTTON'))}
-            style={[styles.sosButton, isSOSActive ? styles.sosButtonActive : styles.sosButtonIdle]}
-          >
-            <Radio size={54} color="#fff" />
-            <Text style={styles.sosButtonText}>
-              {isSOSActive ? 'CANCEL SOS' : 'SOS'}
-            </Text>
-          </TouchableOpacity>
-
-          <Text style={styles.sosSubtext}>
-            {isSOSActive
-              ? `State: ${sosState} • Streaming GPS & Audio Chunks`
-              : 'Network-Adaptive • Shake & Voice Armed'}
-          </Text>
-        </View>
-
-        {/* Live GPS Coordinates Banner */}
-        {currentCoords && (
-          <View style={styles.coordsCard}>
-            <View style={styles.coordRow}>
-              <Navigation size={16} color="#06b6d4" />
-              <Text style={styles.coordTitle}>Active GPS Telemetry:</Text>
-            </View>
-            <Text style={styles.coordText}>
-              LAT: {currentCoords.latitude?.toFixed(6)} | LNG: {currentCoords.longitude?.toFixed(6)}
-            </Text>
-          </View>
-        )}
-
-        {/* Triggers & Settings Card */}
-        <View style={[styles.sectionCard, { marginBottom: 16 }]}>
-          <View style={styles.sectionHeader}>
-            <Activity size={18} color="#a5b4fc" />
-            <Text style={styles.sectionTitle}>Multi-Modal Sensor Controls</Text>
-          </View>
-
-          <View style={styles.toggleRow}>
-            <View>
-              <Text style={styles.toggleLabel}>Shake-to-SOS (Accelerometer)</Text>
-              <Text style={styles.toggleSub}>Rapid shake triggers emergency state</Text>
-            </View>
-            <Switch
-              value={shakeEnabled}
-              onValueChange={setShakeEnabled}
-              trackColor={{ false: '#374151', true: '#ef4444' }}
-            />
-          </View>
-
-          <View style={[styles.toggleRow, { borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.06)', paddingTop: 10 }]}>
-            <View>
-              <Text style={styles.toggleLabel}>Voice-Trigger SOS</Text>
-              <Text style={styles.toggleSub}>Monitors for urgent distress cry</Text>
-            </View>
-            <Switch
-              value={voiceEnabled}
-              onValueChange={setVoiceEnabled}
-              trackColor={{ false: '#374151', true: '#ef4444' }}
-            />
-          </View>
-
-          <View style={[styles.toggleRow, { borderTopWidth: 1, borderTopColor: 'rgba(255,255,255,0.06)', paddingTop: 10 }]}>
-            <View>
-              <Text style={styles.toggleLabel}>Phase 2 Silent SMS</Text>
-              <Text style={styles.toggleSub}>Requires custom dev-client build</Text>
-            </View>
-            <Switch
-              value={usePhase2SMS}
-              onValueChange={setUsePhase2SMS}
-              trackColor={{ false: '#374151', true: '#10b981' }}
-            />
-          </View>
-        </View>
-
-        {/* Emergency Contacts Section */}
-        <View style={styles.sectionCard}>
-          <View style={styles.sectionHeader}>
-            <Phone size={18} color="#f87171" />
-            <Text style={styles.sectionTitle}>Emergency Contacts ({contacts.length})</Text>
-          </View>
-
-          {contacts.map((c) => (
-            <View key={c.id} style={styles.contactItem}>
-              <User size={18} color="#9ca3af" />
-              <View style={{ flex: 1, marginLeft: 10 }}>
-                <Text style={styles.contactName}>{c.name}</Text>
-                <Text style={styles.contactPhone}>{c.phone}</Text>
-              </View>
-              <CheckCircle size={16} color="#10b981" />
-            </View>
-          ))}
-
-          {/* Add Contact Form */}
-          <View style={styles.addContactBox}>
-            <TextInput
-              placeholder="Contact Name (e.g. Dad)"
-              placeholderTextColor="#6b7280"
-              value={newContactName}
-              onChangeText={setNewContactName}
-              style={styles.input}
-            />
-            <TextInput
-              placeholder="Phone Number (+91...)"
-              placeholderTextColor="#6b7280"
-              keyboardType="phone-pad"
-              value={newContactPhone}
-              onChangeText={setNewContactPhone}
-              style={styles.input}
-            />
-            <TouchableOpacity onPress={addContact} style={styles.addBtn}>
-              <Text style={styles.addBtnText}>+ Add Emergency Contact</Text>
-            </TouchableOpacity>
-          </View>
-        </View>
-      </ScrollView>
-    </SafeAreaView>
-  );
-}
-
-const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    backgroundColor: '#0a0e17'
-  },
-  authWrapper: {
-    flex: 1,
-    justifyContent: 'center',
-    padding: 24
-  },
-  authLogoBox: {
-    width: 80,
-    height: 80,
-    borderRadius: 24,
-    backgroundColor: 'rgba(239, 68, 68, 0.15)',
-    borderWidth: 1,
-    borderColor: 'rgba(239, 68, 68, 0.4)',
-    alignItems: 'center',
-    justifyContent: 'center',
-    alignSelf: 'center',
-    marginBottom: 16
-  },
-  authTitle: {
-    fontSize: 28,
-    fontWeight: '800',
-    color: '#ffffff',
-    textAlign: 'center',
-    letterSpacing: -0.5
-  },
-  authSubtitle: {
-    fontSize: 13,
-    color: '#9ca3af',
-    textAlign: 'center',
-    marginBottom: 32,
-    marginTop: 4
-  },
-  authCard: {
-    backgroundColor: 'rgba(26, 34, 52, 0.7)',
-    borderRadius: 20,
-    padding: 22,
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.08)'
-  },
-  inputLabel: {
-    color: '#cbd5e1',
-    fontSize: 12,
-    fontWeight: '600',
-    marginBottom: 6,
-    marginTop: 4
-  },
-  loginBtn: {
-    backgroundColor: '#ef4444',
-    paddingVertical: 14,
-    borderRadius: 12,
-    alignItems: 'center',
-    marginTop: 14
-  },
-  loginBtnText: {
-    color: '#ffffff',
-    fontSize: 15,
-    fontWeight: '700'
-  },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingVertical: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: 'rgba(255, 255, 255, 0.08)'
-  },
-  brandGroup: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8
-  },
-  brandTitle: {
-    fontSize: 22,
-    fontWeight: '800',
-    color: '#ffffff',
-    letterSpacing: -0.5
-  },
-  simBadge: {
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-    borderRadius: 8,
-    backgroundColor: 'rgba(255, 255, 255, 0.06)',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.15)'
-  },
-  simActive: {
-    backgroundColor: 'rgba(245, 158, 11, 0.2)',
-    borderColor: 'rgba(245, 158, 11, 0.5)'
-  },
-  simText: {
-    color: '#f59e0b',
-    fontSize: 10,
-    fontWeight: '700'
-  },
-  networkBadge: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 20
-  },
-  netOnline: {
-    backgroundColor: 'rgba(16, 185, 129, 0.2)',
-    borderColor: 'rgba(16, 185, 129, 0.5)',
-    borderWidth: 1
-  },
-  netOffline: {
-    backgroundColor: 'rgba(239, 68, 68, 0.2)',
-    borderColor: 'rgba(239, 68, 68, 0.5)',
-    borderWidth: 1
-  },
-  networkText: {
-    color: '#ffffff',
-    fontSize: 11,
-    fontWeight: '700'
-  },
-  scrollContent: {
-    padding: 20
-  },
-  sosCard: {
-    alignItems: 'center',
-    paddingVertical: 30,
-    backgroundColor: 'rgba(26, 34, 52, 0.6)',
-    borderRadius: 24,
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.08)',
-    marginBottom: 20
-  },
-  sosPrompt: {
-    color: '#9ca3af',
-    fontSize: 11,
-    fontWeight: '700',
-    letterSpacing: 1,
-    marginBottom: 20,
-    textAlign: 'center'
-  },
-  sosButton: {
-    width: 170,
-    height: 170,
-    borderRadius: 85,
-    alignItems: 'center',
-    justifyContent: 'center',
-    elevation: 10,
-    shadowColor: '#ef4444',
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.5,
-    shadowRadius: 15
-  },
-  sosButtonIdle: {
-    backgroundColor: '#ef4444'
-  },
-  sosButtonActive: {
-    backgroundColor: '#10b981'
-  },
-  sosButtonText: {
-    color: '#ffffff',
-    fontSize: 20,
-    fontWeight: '900',
-    marginTop: 6
-  },
-  sosSubtext: {
-    color: '#9ca3af',
-    fontSize: 12,
-    marginTop: 20
-  },
-  coordsCard: {
-    backgroundColor: 'rgba(6, 182, 212, 0.1)',
-    borderWidth: 1,
-    borderColor: 'rgba(6, 182, 212, 0.3)',
-    borderRadius: 14,
-    padding: 14,
-    marginBottom: 20
-  },
-  coordRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 6,
-    marginBottom: 4
-  },
-  coordTitle: {
-    color: '#06b6d4',
-    fontSize: 12,
-    fontWeight: '700'
-  },
-  coordText: {
-    color: '#ffffff',
-    fontFamily: 'monospace',
-    fontSize: 13
-  },
-  sectionCard: {
-    backgroundColor: 'rgba(26, 34, 52, 0.6)',
-    borderRadius: 20,
-    padding: 18,
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.08)'
-  },
-  sectionHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    marginBottom: 14
-  },
-  sectionTitle: {
-    color: '#ffffff',
-    fontSize: 15,
-    fontWeight: '700'
-  },
-  toggleRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 6
-  },
-  toggleLabel: {
-    color: '#ffffff',
-    fontSize: 13,
-    fontWeight: '600'
-  },
-  toggleSub: {
-    color: '#9ca3af',
-    fontSize: 11
-  },
-  contactItem: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    backgroundColor: 'rgba(255, 255, 255, 0.03)',
-    borderRadius: 12,
-    padding: 12,
-    marginBottom: 8
-  },
-  contactName: {
-    color: '#ffffff',
-    fontSize: 14,
-    fontWeight: '600'
-  },
-  contactPhone: {
-    color: '#9ca3af',
-    fontSize: 12
-  },
-  addContactBox: {
-    marginTop: 10,
-    borderTopWidth: 1,
-    borderTopColor: 'rgba(255, 255, 255, 0.06)',
-    paddingTop: 12
-  },
-  input: {
-    backgroundColor: 'rgba(0, 0, 0, 0.3)',
-    borderWidth: 1,
-    borderColor: 'rgba(255, 255, 255, 0.1)',
-    borderRadius: 10,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    color: '#ffffff',
-    fontSize: 13,
-    marginBottom: 8
-  },
-  addBtn: {
-    backgroundColor: 'rgba(99, 102, 241, 0.2)',
-    borderWidth: 1,
-    borderColor: 'rgba(99, 102, 241, 0.4)',
-    borderRadius: 10,
-    paddingVertical: 10,
-    alignItems: 'center'
-  },
-  addBtnText: {
-    color: '#a5b4fc',
-    fontWeight: '700',
-    fontSize: 13
+  if (!isAuthenticated) {
+    return <AuthScreen onAuthenticated={handleAuthenticated} />;
   }
-});
+
+  const screenProps = {
+    userProfile,
+    setUserProfile,
+    contacts,
+    setContacts,
+    settings,
+    setSettings,
+    networkStatus,
+    currentCoords,
+    sosState,
+    countdown,
+    activeSessionId,
+    elapsedSeconds,
+    recordingStatus,
+    nearbyCount,
+    navigate,
+    onTriggerSOS: triggerSOS,
+    onCancelCountdown: cancelCountdown,
+    onResolveSOS: resolveSOS,
+    onLogout: handleLogout,
+  };
+
+  switch (currentScreen) {
+    case 'Home':
+      return <HomeScreen {...screenProps} />;
+    case 'EmergencyActive':
+      return <EmergencyActiveScreen {...screenProps} sessionId={activeSessionId} />;
+    case 'Contacts':
+      return <ContactsScreen {...screenProps} />;
+    case 'Evidence':
+      return <EvidenceScreen {...screenProps} activeSessionId={activeSessionId} />;
+    case 'History':
+      return <HistoryScreen {...screenProps} />;
+    case 'Profile':
+      return <ProfileScreen {...screenProps} />;
+    case 'Settings':
+      return <SettingsScreen {...screenProps} />;
+    default:
+      return <HomeScreen {...screenProps} />;
+  }
+}

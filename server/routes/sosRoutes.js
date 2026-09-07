@@ -222,4 +222,78 @@ router.get('/nearby', async (req, res) => {
   }
 });
 
+/**
+ * GET /api/sos/history/:uid
+ * Returns the emergency session history for a user, sorted newest first.
+ */
+router.get('/history/:uid', async (req, res) => {
+  try {
+    const { uid } = req.params;
+    if (!uid) return res.status(400).json({ error: 'uid is required' });
+
+    if (!db) {
+      return res.json({ history: [], count: 0 });
+    }
+
+    const snap = await db.ref('sosSessions').once('value');
+    const allSessions = snap.val() || {};
+
+    const userSessions = Object.entries(allSessions)
+      .map(([id, session]) => ({ id, ...session }))
+      .filter(s => s.victimUid === uid)
+      .sort((a, b) => (b.startedAt || 0) - (a.startedAt || 0));
+
+    res.json({ history: userSessions, count: userSessions.length });
+  } catch (err) {
+    console.error('[SOS History Error]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/sos/:sessionId/location
+ * REST fallback for streaming location pings when Socket.IO is unavailable.
+ */
+router.post('/:sessionId/location', async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+    const { victimUid, latitude, longitude, accuracy, speed, altitude } = req.body;
+
+    if (!sessionId || latitude === undefined || longitude === undefined) {
+      return res.status(400).json({ error: 'sessionId, latitude, longitude are required' });
+    }
+
+    const { computeGeohash } = require('../services/geoFireService');
+    const geohash = computeGeohash(Number(latitude), Number(longitude));
+
+    const pingPayload = {
+      latitude: Number(latitude),
+      longitude: Number(longitude),
+      accuracy: accuracy || null,
+      speed: speed || null,
+      altitude: altitude || null,
+      geohash,
+      timestamp: Date.now()
+    };
+
+    if (db) {
+      await db.ref(`locationPings/${sessionId}`).push(pingPayload);
+      if (victimUid) {
+        await db.ref(`users/${victimUid}/currentLocation`).set({
+          latitude: Number(latitude),
+          longitude: Number(longitude),
+          geohash,
+          updatedAt: Date.now()
+        });
+      }
+    }
+
+    res.json({ success: true, pingPayload });
+  } catch (err) {
+    console.error('[Location Ping Error]', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
+

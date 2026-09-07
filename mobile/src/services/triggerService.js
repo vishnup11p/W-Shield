@@ -1,5 +1,5 @@
 import { Accelerometer } from 'expo-sensors';
-import { Audio } from 'expo-av';
+import { Audio } from './expoAvMock';
 
 let shakeSubscription = null;
 const SHAKE_THRESHOLD = 2.4; // Tuned acceleration magnitude (G-force)
@@ -52,6 +52,10 @@ export function stopShakeDetection() {
  */
 export async function startVoiceDetection(onVoiceTrigger) {
   if (voiceListeningActive) return;
+  if (!Audio || typeof Audio.requestPermissionsAsync !== 'function') {
+    console.warn('[Voice Trigger] Voice trigger disabled: Native Audio module not loaded in this client');
+    return;
+  }
 
   try {
     const { status } = await Audio.requestPermissionsAsync();
